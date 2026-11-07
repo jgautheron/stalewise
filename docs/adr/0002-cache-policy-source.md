@@ -16,7 +16,7 @@ Raw templates remain a trusted expert mode. A deployment selects either generate
 
 1. Validate and normalize Host before hashing or invalidation. The configured canonical authority replaces aliases consistently.
 2. Handle PURGE/BAN only after ACL validation and backend selection.
-3. Pipe Upgrade/WebSocket and Expect requests. Set `Connection: close` in pipe mode to prevent later uninspected requests sharing that connection.
+3. Pipe only well-formed WebSocket handshakes (GET, `Upgrade: websocket`, `Connection: upgrade`, key and version) and keep `Connection: Upgrade` for them; the tunnel is unchecked by design. Any other Upgrade passes with `Upgrade` removed, and Expect passes. Every other pipe sends `Connection: close` so a later request on that connection cannot skip VCL. Stripping beats 501: RFC 9110 lets a server ignore Upgrade, so h2c-capable clients keep working over HTTP/1.1.
 4. Pass requests with Authorization or Cookie, and methods other than GET/HEAD.
 5. Preserve Varnish's native Range, If-Range, conditional request, and HEAD handling.
 

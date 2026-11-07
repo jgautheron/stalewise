@@ -8,6 +8,10 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 
 ## [Unreleased]
 
+### Security
+
+- Only WebSocket handshakes are piped. Other `Upgrade` requests pass with the header removed, and `Expect` requests pass, so a declined upgrade can no longer tunnel later requests past VCL.
+
 ### Changed
 
 - `--log-level` accepts a level or comma-separated `target=level` directives; span and field filters are no longer accepted and fail startup.

@@ -253,6 +253,18 @@ sub stalewise_policy_response {
 {% endif %}
 }
 
+# Only a well-formed WebSocket handshake may open an unchecked tunnel; other upgrades are ignored.
+sub stalewise_upgrade {
+    if (req.method == "GET" && req.http.Upgrade ~ "^(?i)\s*websocket\s*$" &&
+        req.http.Connection ~ "(?i)(^|,)\s*upgrade\s*(,|$)" &&
+        req.http.Sec-WebSocket-Key && req.http.Sec-WebSocket-Version) {
+        return (pipe);
+    }
+    unset req.http.Upgrade;
+    unset req.http.HTTP2-Settings;
+    return (pass);
+}
+
 sub vcl_recv {
     if (req.restarts == 0) {
         call stalewise_clear_request;
@@ -314,8 +326,11 @@ sub vcl_recv {
     }
     unset req.http.X-Stalewise-Tag;
 
-    if (req.http.Upgrade || req.http.Expect) {
-        return (pipe);
+    if (req.http.Upgrade) {
+        call stalewise_upgrade;
+    }
+    if (req.http.Expect) {
+        return (pass);
     }
     call stalewise_policy_request;
     if (req.method != "GET" && req.method != "HEAD") {
@@ -335,8 +350,8 @@ sub vcl_pipe {
     unset bereq.http.X-Stalewise-Forward;
     unset bereq.http.X-Stalewise-Shard-Key;
     call stalewise_origin_host;
-    if (req.http.Upgrade) {
-        set bereq.http.Upgrade = req.http.Upgrade;
+    if (req.http.Upgrade ~ "^(?i)\s*websocket\s*$") {
+        set bereq.http.Upgrade = "websocket";
         set bereq.http.Connection = "Upgrade";
     } else {
         set bereq.http.Connection = "close";

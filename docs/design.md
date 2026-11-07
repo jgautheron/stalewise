@@ -166,7 +166,7 @@ Reject axum 0.8.9, anyhow 1.0.104, and third-party admin clients: unnecessary la
 
 ## Per-service cache policy
 
-v0.1 requires no service policy: backend headers decide caching. Default TTL is zero. Request Authorization/Cookie passes; Upgrade/Expect pipes. Preserve Vary, Range, and conditional semantics. Never store Set-Cookie, private, no-store, or no-cache responses. Surrogate-Control overrides freshness directives, not privacy safeguards, and disappears before delivery.
+v0.1 requires no service policy: backend headers decide caching. Default TTL is zero. Request Authorization/Cookie passes; only WebSocket handshakes pipe; other Upgrade requests and Expect pass. Preserve Vary, Range, and conditional semantics. Never store Set-Cookie, private, no-store, or no-cache responses. Surrogate-Control overrides freshness directives, not privacy safeguards, and disappears before delivery.
 
 Use s-maxage before max-age, accounting for Age. Store separate stale-while-revalidate and stale-if-error windows; `beresp.grace` retains their maximum, while health selects the usable window. Varnish already initializes grace from Cache-Control stale-while-revalidate; custom parsing handles surrogate directives and stale-if-error. See [policy ADR](adr/0002-cache-policy-source.md) for exact semantics, VCL parsing, and schema.
 

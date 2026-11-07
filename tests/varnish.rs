@@ -1516,3 +1516,143 @@ async fn director_ring_is_deterministic_stable_and_moves_only_changed_ranges() {
     }
     eprintln!("ring: {gained}/240 keys moved to the added member");
 }
+
+/// HTTP/1.1 origin that keeps every connection alive and records each request head it reads.
+async fn start_keepalive_origin() -> (u16, Arc<Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                while let Some(head) = read_head(&mut stream).await {
+                    let close = head.to_ascii_lowercase().contains("connection: close");
+                    log.lock().unwrap().push(head);
+                    let body = "keepalive origin";
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nCache-Control: max-age=60\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if stream.write_all(reply.as_bytes()).await.is_err() || close {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// Reads one request or response head; `None` at EOF.
+async fn read_head(stream: &mut tokio::net::TcpStream) -> Option<String> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if stream.read(&mut byte).await.ok()? == 0 {
+            return None;
+        }
+        head.push(byte[0]);
+    }
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// Reads one response with a Content-Length body from a connection that stays open.
+async fn read_response(stream: &mut tokio::net::TcpStream) -> String {
+    let head = tokio::time::timeout(Duration::from_secs(10), read_head(stream))
+        .await
+        .expect("response in time")
+        .expect("response head");
+    let length: usize = head
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, v)| v.trim().parse().unwrap());
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await.unwrap();
+    head
+}
+
+fn origin_saw(seen: &Arc<Mutex<Vec<String>>>, line: &str) -> usize {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|h| h.starts_with(line))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn declined_upgrade_never_tunnels_the_next_request_past_vcl() {
+    let (port, seen) = start_keepalive_origin().await;
+    let dir = temp_dir("upgrade");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let c = run_cache(&dir, &base_args(port)).await;
+    warm(c.traffic).await;
+    request(c.traffic, "GET", "/cache", "").await;
+    assert!(request(c.traffic, "GET", "/cache", "").await.is_hit());
+    let fetched = origin_saw(&seen, "GET /cache ");
+
+    let mut conn = tokio::net::TcpStream::connect(c.traffic).await.unwrap();
+    conn.write_all(
+        b"GET /h2c HTTP/1.1\r\nHost: catalog.test\r\nUpgrade: h2c\r\nConnection: Upgrade, HTTP2-Settings\r\nHTTP2-Settings: AAMAAABkAARAAAAAAAIAAAAA\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    read_response(&mut conn).await;
+    conn.write_all(b"GET /cache HTTP/1.1\r\nHost: catalog.test\r\n\r\n")
+        .await
+        .unwrap();
+    let second = read_response(&mut conn).await;
+    assert!(
+        second.to_ascii_lowercase().contains("x-varnish:"),
+        "the second request went through VCL: {second}"
+    );
+    assert_eq!(
+        origin_saw(&seen, "GET /cache "),
+        fetched,
+        "the second request was a hit, not a tunnelled origin fetch"
+    );
+    let h2c = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|h| h.starts_with("GET /h2c "))
+        .cloned()
+        .unwrap();
+    assert!(!h2c.to_ascii_lowercase().contains("upgrade: h2c"), "{h2c}");
+
+    let mut ws = tokio::net::TcpStream::connect(c.traffic).await.unwrap();
+    ws.write_all(b"GET /ws HTTP/1.1\r\nHost: catalog.test\r\nUpgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        .await
+        .unwrap();
+    read_response(&mut ws).await;
+    let tunnel = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|h| h.starts_with("GET /ws "))
+        .cloned()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(tunnel.contains("connection: upgrade"), "{tunnel}");
+    assert!(tunnel.contains("upgrade: websocket"), "{tunnel}");
+
+    request(c.traffic, "POST", "/expect", "Expect: 100-continue\r\n").await;
+    let expect = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|h| h.starts_with("POST /expect "))
+        .cloned()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(
+        expect.contains("x-varnish:"),
+        "Expect requests pass through VCL instead of a pipe: {expect}"
+    );
+}

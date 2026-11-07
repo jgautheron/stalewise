@@ -76,7 +76,10 @@ The embedded templates cache only what the origin's headers allow.
 - `stale-while-revalidate` and `stale-if-error` become grace.
   Stale objects are served within the revalidation window while the origin is healthy, and within the larger window when the origin is sick.
 - Requests with `Authorization` or `Cookie`, and methods other than `GET` and `HEAD`, pass to the origin.
-- `Upgrade` and `Expect` requests are piped.
+- Only a WebSocket handshake (`GET` with `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Key` and `Sec-WebSocket-Version`) is piped.
+  A WebSocket tunnel is unchecked by design: after the handshake, Varnish copies bytes in both directions and no VCL rule applies to them.
+- Other `Upgrade` requests pass to the origin with the `Upgrade` header removed, so the connection stays plain HTTP/1.1.
+- `Expect: 100-continue` requests pass to the origin.
 - `Set-Cookie`, `private`, `no-store`, `no-cache`, `Vary: *` and `text/event-stream` responses are never stored.
 - Uncacheable responses become hit-for-miss objects for `--uncacheable-ttl` (default 30s).
 - Responses whose `Content-Length` exceeds `--max-object-size` (default 10 MiB) stream without being stored.

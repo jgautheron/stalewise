@@ -291,6 +291,8 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         };
 
     let failure = tokio::select! {
+        biased;
+        () = root.cancelled() => None,
         result = &mut child => {
             root.cancel();
             tracing::error!(reason = %describe_child(result), "varnishd is gone; exiting");
@@ -298,7 +300,6 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         }
         result = &mut mgmt_task => Some(format!("management listener stopped: {}", flatten(result))),
         result = &mut signal_task => Some(format!("signaller stopped: {}", flatten(result))),
-        () = root.cancelled() => None,
     };
     root.cancel();
     if let Some(reason) = failure {

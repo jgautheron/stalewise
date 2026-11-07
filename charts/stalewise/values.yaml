@@ -50,8 +50,6 @@ signaller:
     name: ""
     key: token
   methods: [PURGE, BAN]
-  # Pod CIDRs peers send from; required when enabled without a sidecar.
-  peerCIDRs: []
   deliveryDeadline: 10s
 
 # Extra purge ACL entries beyond loopback and the signaller defaults.

@@ -510,6 +510,7 @@ mod tests {
                 canonical_host: None,
                 backend_authority: "origin:80".parse().unwrap(),
                 purge_acl: vec![],
+                peer_purge: false,
                 probe_path: "/".into(),
                 uncacheable_ttl: Duration::from_secs(30),
                 max_object_size: 1,

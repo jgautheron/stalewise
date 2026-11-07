@@ -82,10 +82,10 @@ curl -X BAN -H "Authorization: Bearer $TOKEN" -H 'X-Stalewise-Tag: product-42' \
 
 Varnish accepts `PURGE` and `BAN` only from addresses in `--purge-acl`, which defaults to loopback.
 The local delivery always arrives from loopback, but peer deliveries arrive from peer pod IPs.
-Without a sidecar, add the pod CIDRs to the ACL.
-With an Istio-style sidecar, inbound traffic arrives from `127.0.0.6`, so the ACL must include `127.0.0.6/32`.
-That entry admits every caller the sidecar forwards, so restrict invalidation methods with a mesh `AuthorizationPolicy` or a NetworkPolicy.
-The Helm chart renders the correct ACL and can render that `AuthorizationPolicy` for you.
+With `--signaller`, each discovered peer pod address is added to the ACL as a single-host entry, so you never list pod CIDRs.
+With an Istio-style sidecar, inbound traffic arrives from `127.0.0.6`.
+That address admits every caller the sidecar forwards, so trust it only together with a mesh `AuthorizationPolicy` that restricts invalidation methods.
+The Helm chart adds `127.0.0.6/32` only when it renders that `AuthorizationPolicy`.
 
 ## Helm chart
 
@@ -98,7 +98,7 @@ helm install catalog-cache charts/stalewise --set backend.service=catalog
 helm install catalog-cache charts/stalewise -f charts/stalewise/values-mesh.yaml
 ```
 
-When `signaller.enabled` is true, the chart requires either `signaller.peerCIDRs` or `mesh.sidecar=true` so that peer purges are not silently refused.
+When `mesh.sidecar` and `signaller.enabled` are both true, the chart fails unless `mesh.authorizationPolicy` is also true.
 
 ## Attaching traffic with `cache.enabled`
 

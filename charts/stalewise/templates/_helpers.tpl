@@ -39,18 +39,15 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- end -}}
 {{- end -}}
 
-{{/* Peer purges arrive from pod IPs, or from 127.0.0.6 once a sidecar intercepts them. */}}
+{{/* Peer pod IPs join the ACL at runtime; a sidecar hides them behind 127.0.0.6, trusted only under the AuthorizationPolicy. */}}
 {{- define "stalewise.purgeAcl" -}}
 {{- $acl := list "127.0.0.1/32" "::1/128" -}}
-{{- if .Values.signaller.enabled -}}
-{{- if and .Values.mesh.sidecar (not .Values.mesh.authorizationPolicy) -}}
+{{- $sidecar := and .Values.mesh.sidecar .Values.signaller.enabled -}}
+{{- if and $sidecar (not .Values.mesh.authorizationPolicy) -}}
 {{- fail "mesh.authorizationPolicy must be true when mesh.sidecar and signaller.enabled are set; otherwise any mesh client could PURGE or BAN" -}}
-{{- else if .Values.mesh.sidecar -}}
-{{- $acl = append $acl "127.0.0.6/32" -}}
-{{- else if not .Values.signaller.peerCIDRs -}}
-{{- fail "signaller.peerCIDRs must list the pod CIDRs peers purge from (or set mesh.sidecar=true)" -}}
 {{- end -}}
-{{- $acl = concat $acl .Values.signaller.peerCIDRs -}}
+{{- if and .Values.mesh.sidecar .Values.mesh.authorizationPolicy -}}
+{{- $acl = append $acl "127.0.0.6/32" -}}
 {{- end -}}
 {{- $acl = concat $acl .Values.purgeAcl -}}
 {{- join "," (uniq $acl) -}}

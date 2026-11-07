@@ -145,6 +145,12 @@ pub struct Cidr {
 }
 
 impl Cidr {
+    /// The single-address network, `/32` or `/128`, for `addr`.
+    pub fn host(addr: IpAddr) -> Self {
+        let prefix = if addr.is_ipv4() { 32 } else { 128 };
+        Self { addr, prefix }
+    }
+
     pub fn addr(&self) -> IpAddr {
         self.addr
     }

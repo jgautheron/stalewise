@@ -68,7 +68,9 @@ Remove Authorization, proxy credentials, standard hop-by-hop headers, and every 
 
 A dispatcher owns the queue receiver and at most N delivery tasks. Admission reserves all destination slots with `try_reserve_many`; a peer set exceeding capacity returns 503. Requests share body storage. Retry transient errors with 100ms–1s exponential full jitter, respecting the admission-time deadline. Other 4xx responses terminate delivery. Redirects never cause delivery elsewhere. Queue expiry counts as exhaustion even without a network attempt. No retry survives the deadline or shutdown budget.
 
-202 is not durable: crashes can lose queued work. Retries can duplicate invalidations. The purge ACL must explicitly include permitted peer sources. The loopback-only default intentionally denies remote peer requests until configured. Mesh sidecars can hide source IPs, so ACLs alone do not authenticate remote peers. Restrict invalidation reachability with mesh authorization/network policy; the token protects only signaller admission.
+202 is not durable: crashes can lose queued work. Retries can duplicate invalidations. Mesh sidecars can hide source IPs, so ACLs alone do not authenticate remote peers. Restrict invalidation reachability with mesh authorization/network policy; the token protects only signaller admission.
+
+With the signaller enabled, the reloader renders each discovered peer pod address into the purge ACL as a `/32` or `/128` entry; operators never list cluster pod CIDRs. We chose this over forwarding to peer signaller ports because it reuses the existing reload path and needs no second authenticated hop or loop guard. The sidecar address `127.0.0.6` is trusted only when the chart also enforces the AuthorizationPolicy.
 
 ### Observability
 

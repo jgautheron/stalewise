@@ -20,7 +20,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Profile;
-use crate::endpoint::{Authority, Cidr, Endpoint};
+use crate::endpoint::{Authority, Cidr, Endpoint, Host};
 
 /// Template input and rendered output limit.
 pub const MAX_BYTES: usize = 1 << 20;
@@ -103,6 +103,8 @@ pub struct RenderSettings {
     pub canonical_host: Option<Authority>,
     pub backend_authority: Authority,
     pub purge_acl: Vec<Cidr>,
+    /// Admit discovered peer pod addresses to the purge ACL, one host entry each.
+    pub peer_purge: bool,
     pub probe_path: String,
     pub uncacheable_ttl: Duration,
     pub max_object_size: u64,
@@ -141,12 +143,26 @@ impl Context {
             env: settings.env.clone(),
             canonical_host: settings.canonical_host.clone(),
             backend_authority: settings.backend_authority.clone(),
-            purge_acl: settings.purge_acl.clone(),
+            purge_acl: purge_acl(settings, frontends),
             probe_path: settings.probe_path.clone(),
             uncacheable_ttl_seconds: settings.uncacheable_ttl.as_secs().max(1),
             max_object_size: settings.max_object_size,
         })
     }
+}
+
+fn purge_acl(settings: &RenderSettings, frontends: &[Endpoint]) -> Vec<Cidr> {
+    let mut acl = settings.purge_acl.clone();
+    let peers = frontends.iter().filter_map(|e| match e.host {
+        Host::Ip(ip) if settings.peer_purge => Some(Cidr::host(ip)),
+        _ => None,
+    });
+    for peer in peers {
+        if !acl.contains(&peer) {
+            acl.push(peer);
+        }
+    }
+    acl
 }
 
 fn check_unique(endpoints: &[Endpoint]) -> Result<(), RenderError> {
@@ -389,6 +405,7 @@ mod tests {
             canonical_host: Some("catalog.apps.svc.cluster.local".parse().unwrap()),
             backend_authority: "catalog.apps.svc.cluster.local:8080".parse().unwrap(),
             purge_acl: vec!["127.0.0.1".parse().unwrap(), "10.0.0.0/8".parse().unwrap()],
+            peer_purge: false,
             probe_path: "/healthz".into(),
             uncacheable_ttl: Duration::from_secs(30),
             max_object_size: 10_485_760,
@@ -417,6 +434,28 @@ mod tests {
         assert!(out.contains("set beresp.ttl = 30s;"));
         assert!(out.contains("> 10485760)"));
         assert!(out.contains("set req.http.Host = \"catalog.apps.svc.cluster.local\";"));
+    }
+
+    #[test]
+    fn peer_purge_admits_each_discovered_peer_as_a_single_host() {
+        let mut with = settings();
+        with.purge_acl = vec!["127.0.0.1".parse().unwrap()];
+        with.peer_purge = true;
+        let peers = [ip("10.1.2.3", 8080), ip("fd00::9", 8080)];
+        let render_acl = |s: &RenderSettings| {
+            let ctx = Context::new(s, &peers, &[ip("10.0.0.7", 8080)]).unwrap();
+            String::from_utf8(render(&Template::embedded(Profile::Generic).source, &ctx).unwrap())
+                .unwrap()
+        };
+        let out = render_acl(&with);
+        assert!(out.contains("\"10.1.2.3\"/32;"));
+        assert!(out.contains("\"fd00::9\"/128;"));
+        with.peer_purge = false;
+        let out = render_acl(&with);
+        assert!(
+            !out.contains("10.1.2.3"),
+            "peers are untrusted without the signaller"
+        );
     }
 
     #[test]

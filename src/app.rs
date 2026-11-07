@@ -102,6 +102,7 @@ fn render_settings(config: &Config) -> RenderSettings {
         canonical_host: config.canonical_host.clone(),
         backend_authority: config.backend_authority.clone(),
         purge_acl: config.purge_acl.clone(),
+        peer_purge: config.signaller.is_some(),
         probe_path: config.backend_probe_path.clone(),
         uncacheable_ttl: config.uncacheable_ttl,
         max_object_size: config.max_object_size,

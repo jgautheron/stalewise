@@ -200,7 +200,7 @@ Build admin/render/process first, then discovery/reload, signaller/management, p
 
 ## v0.3
 
-This is a planned contract, not implemented behavior. [ADR 0004](adr/0004-sharding-and-purge-consistency.md) defines routing, failure handling, tests, migration, and rejected alternatives. Existing modules remain responsible; there is no new proxy or controller.
+Implemented in 0.3.0. [ADR 0004](adr/0004-sharding-and-purge-consistency.md) defines routing, failure handling, tests, migration, and rejected alternatives. Existing modules remain responsible; there is no new proxy or controller.
 
 ### Configuration and ownership
 
@@ -239,3 +239,11 @@ Writes return 202, relative Location, and `X-Stalewise-Pod`. `X-Stalewise-Wait` 
 Add histogram `stalewise_invalidation_latency_seconds{result="delivered|exhausted"}` from admission to final target completion. Add gauge `stalewise_invalidation_peers_lagging`: distinct peer identities with any retained pending/exhausted result. Eviction may lower it; it is not proof of coherence. Log IDs and bounded failure reasons, never URLs or credentials.
 
 Implement status first, then membership and VCL forwarding. Require three-instance fills=1, owner-failure fallback, broadcast purge/status, and authenticated wait tests before opt-in rollout. Disable sharding before binary rollback. No TUI or additional product surface is planned.
+
+### Implementation notes
+
+- The Varnish 9.1 shard director clamps rather than wraps: keys above the last ring point belong to the last point, keys below the first to the first. Ring fixtures assert this edge behaviour.
+- Peers allowed to send hop headers are the discovered peer addresses plus `--purge-acl`; the chart's sidecar entry stays gated on the AuthorizationPolicy.
+- `X-Stalewise-Peer-Tags` uses the stored `,tag,` form; `,` encodes an empty tag set so the field is always present.
+- A wait returns as soon as every target is terminal: 200 when all delivered, otherwise 504 without waiting for the timeout.
+- `--pod-name` is required by the signaller as well as sharding, because status reports the admitting pod.

@@ -9,6 +9,7 @@ The design is in [docs/design.md](docs/design.md), with decisions in [docs/adr](
 ## How it works
 
 - Discovery watches `discovery.k8s.io/v1` EndpointSlices for the peer Service and, in the generic profile, the origin Service.
+  Peers are identified by `namespace/pod`, sorted by name, and debounced by `--membership-debounce`.
 - Rendering fills a VCL template with sorted, deduplicated endpoints and validated settings.
 - The reload loop compiles each candidate with `vcl.inline`, activates it with `vcl.use`, and confirms it with `vcl.list`.
   It skips byte-identical renders and keeps the last good VCL when anything fails.
@@ -133,10 +134,20 @@ Pass the cache pods' labels with `--cache-source-labels` so the check can match 
 
 ## Invalidation
 
-Enable the signaller with `--signaller`, `--signaller-token-file` and `--pod-ip`.
+Enable the signaller with `--signaller`, `--signaller-token-file`, `--pod-ip` and `--pod-name`.
 On a dual-stack pod, pass every pod address to `--pod-ip` as a comma-separated list.
 Callers send `PURGE` for one URL, or `BAN` with exactly one `X-Stalewise-Tag` header, to port 8081 with `Authorization: Bearer <token>`.
 A `202 Accepted` response means the request is queued in memory, not that every peer purged it.
+
+Each accepted write returns a JSON status, `Location: /invalidations/<id>` and `X-Stalewise-Pod`.
+The status lists every target frozen at admission as `pending`, `delivered` or `exhausted`, with a reason of `rejected`, `deadline` or `shutdown`.
+Poll `GET /invalidations/<id>` with the same bearer token, optionally with `?wait=10s`, on the pod that admitted the write.
+Another pod, an evicted record or a restarted pod answers 404.
+Through a balanced Service, send `X-Stalewise-Wait: 10s` on the write instead.
+A waiting request returns 200 when every target acknowledged and 504 with the current status otherwise.
+Waits are capped at 30s, and a timeout never cancels delivery.
+`--invalidation-history` bounds the retained records; a write that cannot fit beside pending records gets 503.
+Delivery is an acknowledgment, not a global freshness barrier.
 
 Call the signaller Service by its own name and do not override `Host`.
 Behind a mesh, a `Host` set to the application host makes the caller's sidecar route the request to the application, not to the signaller.
@@ -160,6 +171,26 @@ Peer deliveries dial each peer pod address and send `--peer-authority` as `Host`
 The chart sets it to the headless peers Service, for example `catalog-cache-stalewise-peers.apps.svc.cluster.local:8080`.
 Every delivery carries the invalidation host in `X-Stalewise-Host`.
 Varnish uses that header as the purge or ban key host only when the client is in the purge ACL, and it removes the header from every other request.
+
+## Sharding
+
+`--shard` routes each object to one owner pod, so a cold object is filled once for the whole Deployment.
+It needs `--pod-name`, `--pod-ip` and `--peer-authority`.
+The generated VCL feeds every peer, identified by `namespace/pod`, to a `directors.shard()` ring with 67 points per peer.
+The ring key is the normalised authority plus the URL, or the policy-normalised URL when a CachePolicy sets one.
+Ownership ignores health, so replicas with the same membership always agree.
+
+A non-owner forwards a miss to the owner's pod address with `Host: <peer-authority>`, `X-Stalewise-Host: <authority>` and `X-Stalewise-Shard-Hop: 1`.
+The owner restores the authority, serves the request itself, and never forwards it again.
+Only discovered peer addresses and `--purge-acl` entries may send these headers; others get 403, and malformed or duplicated fields get 400.
+If the owner fails before the response starts, the request is retried once against the origin, and `--peer-timeout` bounds each forward.
+Membership changes wait for `--membership-debounce`, and an empty membership fetches from the origin directly.
+
+Non-owners store nothing by default.
+`--shard-local-ttl` (at most 30s) lets them keep short copies, capped by the owner's remaining freshness and without grace.
+Purges and bans still broadcast to every peer, so they also reach these copies.
+Custom templates must handle `X-Stalewise-Shard-Hop`; rendering fails when sharding is on and a template ignores it.
+Upgrade every replica before enabling sharding, and disable it before rolling back the binary.
 
 ## Helm chart
 
@@ -196,7 +227,8 @@ stalewise:
 `scripts/chart-check.sh` renders the documented release and validates it with kubeconform.
 Regenerate the CRD after changing the Rust types with `cargo run -- crd > charts/stalewise/crds/cachepolicies.stalewise.dev.yaml`; a unit test fails while the committed file is stale.
 
-When `mesh.sidecar` and `signaller.enabled` are both true, the chart fails unless `mesh.authorizationPolicy` is also true.
+When `mesh.sidecar` is true with `signaller.enabled` or `shard.enabled`, the chart fails unless `mesh.authorizationPolicy` is also true.
+With `shard.enabled`, that policy also denies `x-stalewise-shard-hop` requests from any other identity.
 
 ## Attaching traffic with `cache.enabled`
 
@@ -230,6 +262,8 @@ To remove caching, delete the cache match and wait for route propagation before 
 | `stalewise_signaller_requests_total` | `status_class` |
 | `stalewise_signaller_queue_depth`, `stalewise_signaller_exhausted_deliveries_total` | none |
 | `stalewise_signaller_deliveries_total` | `result` |
+| `stalewise_invalidation_latency_seconds` (histogram, admission to last target) | `result` (`delivered`, `exhausted`) |
+| `stalewise_invalidation_peers_lagging` | none |
 | `stalewise_ready`, `stalewise_degraded` | none |
 | `stalewise_degradation_events_total` | `reason` |
 

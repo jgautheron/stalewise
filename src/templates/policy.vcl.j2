@@ -1,0 +1,307 @@
+
+acl stalewise_purgers {
+{% for net in purge_acl %}
+    "{{ net.addr }}"/{{ net.prefix }};
+{% endfor %}
+}
+
+acl stalewise_loopback {
+    "127.0.0.0"/8;
+    "::1"/128;
+}
+
+sub stalewise_clear_request {
+    unset req.http.X-Stalewise-Swr;
+    unset req.http.X-Stalewise-Sie;
+    unset req.http.X-Stalewise-Control;
+    unset req.http.X-Stalewise-Fresh;
+    unset req.http.X-Stalewise-Tags;
+    unset req.http.X-Stalewise-Host;
+}
+
+sub vcl_recv {
+    call stalewise_clear_request;
+    if (req.url == "/__stalewise_probe") {
+        if (client.ip ~ stalewise_loopback) {
+            return (synth(200, "OK"));
+        }
+        return (synth(404, "Not Found"));
+    }
+{% if canonical_host %}
+    set req.http.Host = "{{ canonical_host }}";
+{% else %}
+    if (req.http.Host) {
+        set req.http.Host = std.tolower(req.http.Host);
+    }
+{% endif %}
+    if (req.http.Host && req.http.Host !~ "^([a-z0-9_.-]+|\[[0-9a-f:.]+\])(:[0-9]{1,5})?$") {
+        return (synth(400, "Bad Request"));
+    }
+    call stalewise_select_backend;
+
+    if (req.method == "PURGE") {
+        if (client.ip !~ stalewise_purgers) {
+            return (synth(403, "Forbidden"));
+        }
+        return (purge);
+    }
+    if (req.method == "BAN") {
+        if (client.ip !~ stalewise_purgers) {
+            return (synth(403, "Forbidden"));
+        }
+        std.collect(req.http.X-Stalewise-Tag);
+        if (!req.http.Host || req.http.X-Stalewise-Tag !~ "^[A-Za-z0-9_-]{1,128}$") {
+            return (synth(400, "Bad Request"));
+        }
+        # Host and tag are validated above, so neither can alter the fixed expression.
+        if (std.ban({"obj.http.X-Stalewise-Host == ""} + req.http.Host +
+            {"" && obj.http.X-Stalewise-Tags ~ " "} + req.http.X-Stalewise-Tag + {" ""})) {
+            return (synth(200, "Banned"));
+        }
+        return (synth(400, "Bad Request"));
+    }
+    unset req.http.X-Stalewise-Tag;
+
+    if (req.http.Upgrade || req.http.Expect) {
+        return (pipe);
+    }
+    if (req.method != "GET" && req.method != "HEAD") {
+        return (pass);
+    }
+    if (req.http.Authorization || req.http.Cookie) {
+        return (pass);
+    }
+    return (hash);
+}
+
+sub vcl_pipe {
+    call stalewise_origin_host;
+    if (req.http.Upgrade) {
+        set bereq.http.Upgrade = req.http.Upgrade;
+        set bereq.http.Connection = "Upgrade";
+    } else {
+        set bereq.http.Connection = "close";
+    }
+}
+
+# Request IDs and tracing headers never enter the key.
+sub vcl_hash {
+    hash_data(req.url);
+    if (req.http.Host) {
+        hash_data(req.http.Host);
+    } else {
+        hash_data(server.ip);
+    }
+    return (lookup);
+}
+
+sub vcl_hit {
+    if (obj.ttl >= 0s) {
+        return (deliver);
+    }
+    if (std.healthy(req.backend_hint)) {
+        if (obj.ttl + std.duration(obj.http.X-Stalewise-Swr + "s", 0s) > 0s) {
+            return (deliver);
+        }
+    } elsif (obj.ttl + obj.grace > 0s) {
+        return (deliver);
+    }
+    if (req.restarts == 0) {
+        set req.hash_always_miss = true;
+        return (restart);
+    }
+    return (pass);
+}
+
+sub vcl_backend_fetch {
+    call stalewise_origin_host;
+}
+
+sub stalewise_clear_response {
+    unset beresp.http.X-Stalewise-Swr;
+    unset beresp.http.X-Stalewise-Sie;
+    unset beresp.http.X-Stalewise-Control;
+    unset beresp.http.X-Stalewise-Fresh;
+    unset beresp.http.X-Stalewise-Tags;
+    unset beresp.http.X-Stalewise-Host;
+}
+
+sub stalewise_uncacheable {
+    call stalewise_clear_response;
+    unset beresp.http.Surrogate-Control;
+    set beresp.ttl = {{ uncacheable_ttl_seconds }}s;
+    set beresp.grace = 0s;
+    set beresp.keep = 0s;
+    set beresp.uncacheable = true;
+    return (deliver);
+}
+
+sub stalewise_privacy {
+    if (beresp.status != 200 && beresp.status != 203 && beresp.status != 204 &&
+        beresp.status != 300 && beresp.status != 301 && beresp.status != 302 &&
+        beresp.status != 304 && beresp.status != 307 && beresp.status != 308 &&
+        beresp.status != 404 && beresp.status != 410 && beresp.status != 414) {
+        call stalewise_uncacheable;
+    }
+    if (beresp.http.Set-Cookie) {
+        call stalewise_uncacheable;
+    }
+    if (beresp.http.Cache-Control ~ "(?i)(^|,)\s*(private|no-store|no-cache)\s*(=|,|$)" ||
+        beresp.http.Surrogate-Control ~ "(?i)(^|,)\s*(private|no-store|no-cache)\s*(=|,|$)") {
+        call stalewise_uncacheable;
+    }
+    if (beresp.http.Vary ~ "(^|,)\s*\*\s*(,|$)") {
+        call stalewise_uncacheable;
+    }
+    if (beresp.http.Content-Type ~ "(?i)^\s*text/event-stream") {
+        call stalewise_uncacheable;
+    }
+    if (beresp.http.Content-Length ~ "^[0-9]{16,}$" ||
+        std.integer(beresp.http.Content-Length, 0) > {{ max_object_size }}) {
+        call stalewise_uncacheable;
+    }
+    if (beresp.http.Age && beresp.http.Age !~ "^[0-9]{1,9}$") {
+        call stalewise_uncacheable;
+    }
+}
+
+# Malformed, duplicated or ambiguous known directives disable storage.
+sub stalewise_validate_control {
+    if (beresp.http.X-Stalewise-Control &&
+        beresp.http.X-Stalewise-Control !~ {"^\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+(\s*=\s*("[^"]*"|[!#$%&'*+.^_`|~0-9A-Za-z-]+))?(\s*,\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+(\s*=\s*("[^"]*"|[!#$%&'*+.^_`|~0-9A-Za-z-]+))?)*\s*$"}) {
+        call stalewise_uncacheable;
+    }
+    if (beresp.http.X-Stalewise-Control ~ {""[^"]*,"}) {
+        call stalewise_uncacheable;
+    }
+{% for d in ["max-age", "s-maxage", "stale-while-revalidate", "stale-if-error"] %}
+    if (beresp.http.X-Stalewise-Control ~ "(?i)(^|,)\s*{{ d }}\s*(=|,|$)" &&
+        beresp.http.X-Stalewise-Control !~ "(?i)(^|,)\s*{{ d }}\s*=\s*[0-9]{1,9}\s*(,|$)") {
+        call stalewise_uncacheable;
+    }
+    if (beresp.http.X-Stalewise-Control ~ "(?i)(^|,)\s*{{ d }}\s*(=|,|$).*,\s*{{ d }}\s*(=|,|$)") {
+        call stalewise_uncacheable;
+    }
+{% endfor %}
+}
+
+sub stalewise_freshness {
+    set beresp.http.X-Stalewise-Fresh = "";
+    if (beresp.http.X-Stalewise-Control ~ "(?i)(^|,)\s*s-maxage\s*=") {
+        set beresp.http.X-Stalewise-Fresh = regsub(beresp.http.X-Stalewise-Control,
+            "(?i)^.*(?:^|,)\s*s-maxage\s*=\s*([0-9]+)\s*(?:,.*)?$", "\1");
+    } elsif (beresp.http.X-Stalewise-Control ~ "(?i)(^|,)\s*max-age\s*=") {
+        set beresp.http.X-Stalewise-Fresh = regsub(beresp.http.X-Stalewise-Control,
+            "(?i)^.*(?:^|,)\s*max-age\s*=\s*([0-9]+)\s*(?:,.*)?$", "\1");
+    }
+    if (beresp.http.Surrogate-Control) {
+        if (beresp.http.X-Stalewise-Fresh == "") {
+            call stalewise_uncacheable;
+        }
+        set beresp.ttl = std.duration(beresp.http.X-Stalewise-Fresh + "s", 0s) -
+            std.duration(beresp.http.Age + "s", 0s);
+    } elsif (beresp.http.X-Stalewise-Fresh == "" && !beresp.http.Expires) {
+        call stalewise_uncacheable;
+    }
+}
+
+sub stalewise_stale_windows {
+    set beresp.http.X-Stalewise-Swr = "0";
+    set beresp.http.X-Stalewise-Sie = "0";
+    if (beresp.http.X-Stalewise-Control ~ "(?i)(^|,) *stale-while-revalidate *= *[0-9]+ *(,|$)") {
+        set beresp.http.X-Stalewise-Swr = regsub(
+            beresp.http.X-Stalewise-Control,
+            "(?i)^.*(?:^|,) *stale-while-revalidate *= *([0-9]+) *(?:,.*)?$", "\1");
+    }
+    if (beresp.http.X-Stalewise-Control ~ "(?i)(^|,) *stale-if-error *= *[0-9]+ *(,|$)") {
+        set beresp.http.X-Stalewise-Sie = regsub(
+            beresp.http.X-Stalewise-Control,
+            "(?i)^.*(?:^|,) *stale-if-error *= *([0-9]+) *(?:,.*)?$", "\1");
+    }
+    if (std.duration(beresp.http.X-Stalewise-Swr + "s", 0s) > 604800s) {
+        set beresp.http.X-Stalewise-Swr = "604800";
+    }
+    if (std.duration(beresp.http.X-Stalewise-Sie + "s", 0s) > 604800s) {
+        set beresp.http.X-Stalewise-Sie = "604800";
+    }
+    # Already stale on arrival: shrink the allowances instead of restarting them.
+    if (beresp.ttl < 0s) {
+        set beresp.http.X-Stalewise-Swr = std.duration(beresp.http.X-Stalewise-Swr + "s", 0s) + beresp.ttl;
+        set beresp.http.X-Stalewise-Sie = std.duration(beresp.http.X-Stalewise-Sie + "s", 0s) + beresp.ttl;
+        set beresp.ttl = 0s;
+    }
+    set beresp.grace = std.duration(beresp.http.X-Stalewise-Swr + "s", 0s);
+    if (std.duration(beresp.http.X-Stalewise-Sie + "s", 0s) > beresp.grace) {
+        set beresp.grace = std.duration(beresp.http.X-Stalewise-Sie + "s", 0s);
+    }
+    if (beresp.grace < 0s) {
+        set beresp.grace = 0s;
+    }
+    if (beresp.ttl <= 0s && beresp.grace <= 0s) {
+        call stalewise_uncacheable;
+    }
+}
+
+sub stalewise_tags {
+    std.collect(beresp.http.Surrogate-Key, " ");
+    std.collect(beresp.http.Cache-Tag, ",");
+    set beresp.http.X-Stalewise-Tags = regsuball(
+        beresp.http.Surrogate-Key + " " + beresp.http.Cache-Tag, "[\s,]+", " ");
+    set beresp.http.X-Stalewise-Tags = regsuball(beresp.http.X-Stalewise-Tags, "^ +| +$", "");
+    if (beresp.http.X-Stalewise-Tags == "" ||
+        beresp.http.X-Stalewise-Tags !~ "^[ A-Za-z0-9_-]{1,4094}$" ||
+        beresp.http.X-Stalewise-Tags ~ "[A-Za-z0-9_-]{129}") {
+        unset beresp.http.X-Stalewise-Tags;
+    } else {
+        set beresp.http.X-Stalewise-Tags = " " + beresp.http.X-Stalewise-Tags + " ";
+    }
+}
+
+sub vcl_backend_response {
+    call stalewise_clear_response;
+    if (bereq.is_bgfetch && beresp.status >= 500) {
+        return (abandon);
+    }
+    set beresp.do_stream = true;
+    set beresp.grace = 0s;
+    set beresp.keep = 0s;
+    if (bereq.uncacheable) {
+        return (deliver);
+    }
+    std.collect(beresp.http.Cache-Control);
+    std.collect(beresp.http.Surrogate-Control);
+    std.collect(beresp.http.Vary);
+    call stalewise_privacy;
+    if (beresp.http.Surrogate-Control) {
+        set beresp.http.X-Stalewise-Control = beresp.http.Surrogate-Control;
+    } else {
+        set beresp.http.X-Stalewise-Control = beresp.http.Cache-Control;
+    }
+    call stalewise_validate_control;
+    call stalewise_freshness;
+    call stalewise_stale_windows;
+    call stalewise_tags;
+    call stalewise_object_host;
+    unset beresp.http.Surrogate-Control;
+    unset beresp.http.X-Stalewise-Control;
+    unset beresp.http.X-Stalewise-Fresh;
+    return (deliver);
+}
+
+sub vcl_backend_error {
+    if (bereq.is_bgfetch) {
+        return (abandon);
+    }
+}
+
+sub vcl_deliver {
+    unset resp.http.X-Stalewise-Swr;
+    unset resp.http.X-Stalewise-Sie;
+    unset resp.http.X-Stalewise-Control;
+    unset resp.http.X-Stalewise-Fresh;
+    unset resp.http.X-Stalewise-Tags;
+    unset resp.http.X-Stalewise-Host;
+    unset resp.http.Surrogate-Control;
+    unset resp.http.Surrogate-Key;
+    unset resp.http.Cache-Tag;
+}

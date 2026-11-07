@@ -1,0 +1,53 @@
+vcl 4.1;
+
+import std;
+import directors;
+
+{% if backends %}
+probe stalewise_origin_probe {
+    .request =
+        "GET {{ probe_path }} HTTP/1.1"
+        "Host: {{ backend_authority }}"
+        "Connection: close"
+        "User-Agent: stalewise-probe";
+    .timeout = 1s;
+    .interval = 5s;
+    .window = 3;
+    .threshold = 2;
+    .expected_response = 200;
+}
+{% for b in backends %}
+
+backend {{ b.name }} {
+    .host = "{{ b.host }}";
+    .port = "{{ b.port }}";
+    .probe = stalewise_origin_probe;
+}
+{% endfor %}
+{% else %}
+backend stalewise_none none;
+{% endif %}
+
+sub vcl_init {
+{% if backends %}
+    new stalewise_origin = directors.round_robin();
+{% for b in backends %}
+    stalewise_origin.add_backend({{ b.name }});
+{% endfor %}
+{% endif %}
+}
+
+sub stalewise_select_backend {
+{% if backends %}
+    set req.backend_hint = stalewise_origin.backend();
+{% else %}
+    set req.backend_hint = stalewise_none;
+{% endif %}
+}
+
+sub stalewise_origin_host {
+}
+
+sub stalewise_object_host {
+    set beresp.http.X-Stalewise-Host = bereq.http.Host;
+}

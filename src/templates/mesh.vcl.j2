@@ -1,0 +1,39 @@
+vcl 4.1;
+
+import std;
+
+probe stalewise_origin_probe {
+    .request =
+        "GET {{ probe_path }} HTTP/1.1"
+        "Host: {{ backend_authority }}"
+        "Connection: close"
+        "User-Agent: stalewise-probe";
+    .timeout = 1s;
+    .interval = 5s;
+    .window = 3;
+    .threshold = 2;
+    .expected_response = 200;
+}
+
+# One Service DNS origin: the mesh balances it and keeps mTLS intact.
+backend stalewise_origin {
+    .host = "{{ primary_backend.host }}";
+    .port = "{{ primary_backend.port }}";
+    .probe = stalewise_origin_probe;
+}
+
+sub vcl_init {
+}
+
+sub stalewise_select_backend {
+    set req.backend_hint = stalewise_origin;
+}
+
+# The sidecar routes on authority and answers 503 for any other value.
+sub stalewise_origin_host {
+    set bereq.http.Host = "{{ backend_authority }}";
+}
+
+sub stalewise_object_host {
+    set beresp.http.X-Stalewise-Host = "{{ canonical_host }}";
+}

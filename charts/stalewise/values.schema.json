@@ -294,6 +294,9 @@
         "authorizationPolicy": {
           "type": "boolean"
         },
+        "peerAuthentication": {
+          "type": "boolean"
+        },
         "trustDomain": {
           "type": "string",
           "minLength": 1

@@ -89,6 +89,8 @@ mesh:
   # Deny PURGE/BAN at the sidecar unless the caller is this cache's service account.
   # Required with sidecar and signaller: the chart refuses to render without it.
   authorizationPolicy: false
+  # Render a STRICT mTLS PeerAuthentication for the cache pods.
+  peerAuthentication: false
   trustDomain: cluster.local
 
 serviceAccount:

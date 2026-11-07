@@ -9,13 +9,13 @@ out="$work/rendered.yaml"
 fail() { echo "chart-check: $*" >&2; exit 1; }
 expect() { grep -qF -- "$1" "$out" || fail "missing: $1"; }
 
-# kubeconform has no schema for our CRD, so derive one; mesh AuthorizationPolicy is skipped.
+# kubeconform has no schema for our CRD, so derive one; Istio kinds are skipped.
 # The API server rejects unknown spec fields under strict field validation; mirror that here.
 yq -o=json '.spec.versions[0].schema.openAPIV3Schema
   | (.properties.spec | .. | select(type == "!!map" and has("properties"))) += {"additionalProperties": false}' \
   "$chart/crds/cachepolicies.stalewise.dev.yaml" >"$work/cachepolicy-v1alpha1.json"
 validate() {
-  kubeconform -strict -summary -kubernetes-version 1.33.0 -skip AuthorizationPolicy \
+  kubeconform -strict -summary -kubernetes-version 1.33.0 -skip AuthorizationPolicy,PeerAuthentication \
     -schema-location default \
     -schema-location "$work/{{.ResourceKind}}-{{.ResourceAPIVersion}}.json" "$1"
 }
@@ -34,6 +34,7 @@ validate "$out"
 helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog >"$out"
 expect 'name: catalog-cache-stalewise'
 if grep -qF 'cachepolicies' "$out"; then fail "policy RBAC rendered while cachePolicies is disabled"; fi
+if grep -qF 'kind: PeerAuthentication' "$out"; then fail "PeerAuthentication rendered by default"; fi
 validate "$out"
 helm template catalog-cache "$chart" --namespace apps -f "$chart/values-mesh.yaml" \
   --set shard.enabled=true --set shard.localTtl=5s >"$out"
@@ -42,6 +43,12 @@ expect 'value: "5s"'
 expect 'fieldPath: metadata.name'
 expect 'value: "catalog-cache-peers.apps.svc.cluster.local:8080"'
 expect 'key: request.headers[x-stalewise-shard-hop]'
+validate "$out"
+
+helm template catalog-cache "$chart" --namespace apps -f "$chart/values-mesh.yaml" \
+  --set mesh.peerAuthentication=true >"$out"
+expect 'kind: PeerAuthentication'
+expect 'mode: STRICT'
 validate "$out"
 
 if helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog \

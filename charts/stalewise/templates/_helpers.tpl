@@ -43,7 +43,9 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- define "stalewise.purgeAcl" -}}
 {{- $acl := list "127.0.0.1/32" "::1/128" -}}
 {{- if .Values.signaller.enabled -}}
-{{- if .Values.mesh.sidecar -}}
+{{- if and .Values.mesh.sidecar (not .Values.mesh.authorizationPolicy) -}}
+{{- fail "mesh.authorizationPolicy must be true when mesh.sidecar and signaller.enabled are set; otherwise any mesh client could PURGE or BAN" -}}
+{{- else if .Values.mesh.sidecar -}}
 {{- $acl = append $acl "127.0.0.6/32" -}}
 {{- else if not .Values.signaller.peerCIDRs -}}
 {{- fail "signaller.peerCIDRs must list the pod CIDRs peers purge from (or set mesh.sidecar=true)" -}}

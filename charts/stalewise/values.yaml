@@ -61,6 +61,7 @@ mesh:
   # The pod runs an Istio-style sidecar that delivers inbound traffic from 127.0.0.6.
   sidecar: false
   # Deny PURGE/BAN at the sidecar unless the caller is this cache's service account.
+  # Required with sidecar and signaller: the chart refuses to render without it.
   authorizationPolicy: false
   trustDomain: cluster.local
 

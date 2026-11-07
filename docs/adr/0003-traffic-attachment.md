@@ -23,7 +23,7 @@ No configured methods/pathPrefixes means all GET/HEAD. Headers determine caching
 
 ### Reference VirtualService
 
-This complete example assumes namespace `apps`, application Service `catalog`, and cache Service `catalog-cache`, all using port 8080. Cache pods carry the two matching labels. Replace the normal route and retry blocks with the application's existing settings in all three normal-destination rules.
+This complete example assumes namespace `apps`, application Service `catalog`, and cache Service `catalog-cache`, all using port 8080. The chart produces that cache Service for release `catalog-cache` with `fullnameOverride: catalog-cache`; without the override it is `catalog-cache-stalewise`. Cache pods carry the two matching labels. Replace the normal route and retry blocks with the application's existing settings in all three normal-destination rules.
 
 ```yaml
 apiVersion: networking.istio.io/v1

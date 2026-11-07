@@ -1,8 +1,8 @@
-# stalewise v0.1
+# stalewise v0.2
 
 ## Shape and interfaces
 
-One Rust 2024 binary crate supervises Varnish. It never handles cache traffic. v0.1 serves one application per deployment.
+One Rust 2024 binary crate supervises Varnish. It never handles cache traffic. It serves one application per deployment. v0.2 adds the `CachePolicy` resource, read-only attachment validation, and a structured config file.
 
 These are module contracts, not implementation. `Result<T>` carries the owning module's typed error. Invalid external inputs never reach rendering.
 
@@ -16,15 +16,18 @@ These are module contracts, not implementation. `Result<T>` carries the owning m
 | `reload` | Sole configuration writer: `async fn run(config: ReloadConfig, inputs: Inputs, state: watch::Sender<Active>, stop: CancellationToken) -> Result<()>` |
 | `signaller` | Validate/admit bounded invalidations: `async fn serve(config: SignalConfig, peers: watch::Receiver<Discovery>, metrics: Arc<Metrics>, stop: CancellationToken) -> Result<()>` |
 | `mgmt` | Probe/publish status and metrics: `async fn serve(config: ManagementConfig, inputs: StatusInputs, metrics: Arc<Metrics>, stop: CancellationToken) -> Result<()>`; `fn readiness(inputs: &StatusInputs) -> Readiness` |
+| `policy` | `CachePolicy` CRD types, runtime validation and resolution: `fn validate(name, generation, spec, own) -> Result<RenderPolicy, Rejection>`; `fn resolve(candidates, accepted) -> Resolution`; `fn crd_yaml()` |
+| `attach` | Pure route check: `fn validate(target: &Target, virtual_services: &[serde_json::Value]) -> Outcome` |
+| `controller` | Watch CachePolicies and VirtualServices, publish accepted policies, write status: `async fn run(client, config: PolicyConfig, out: watch::Sender<Option<Policies>>, active: watch::Receiver<Option<Active>>, stop)` |
 | `main` | Wire tasks and exit codes: `async fn run(config: Config) -> Result<ExitCode>` |
 
 Admin arguments are `inline(&mut self,name:&VclName,source:&[u8])`, `use_vcl/discard(&mut self,name:&VclName)` and `ping/list(&mut self)`.
 
-Shared values: `Host { Ip(IpAddr), Dns(String) }`; `Endpoint { name:String, host:Host, port:u16 }`; `Discovery { endpoints:Arc<[Endpoint]>, last_success:SystemTime, error:Option<DiscoveryError> }`; `Active { name:VclName, bytes:Arc<[u8]>, since:Instant }`. Initial discovery/active states are `Option::None`, never synthetic success.
+Shared values: `Host { Ip(IpAddr), Dns(String) }`; `Endpoint { name:String, host:Host, port:u16 }`; `Discovery { endpoints:Arc<[Endpoint]>, last_success:SystemTime, error:Option<DiscoveryError> }`; `Active { name:VclName, bytes:Arc<[u8]>, since:Instant, policies:Arc<[RenderPolicy]> }`. Initial discovery/active states are `Option::None`, never synthetic success.
 
 ## Data flow and tasks
 
-Tokio runs independent frontend/backend watchers, template polling, reload, child supervision, management/probing, and optional signaller tasks. Each producer publishes immutable snapshots through `watch<Option<T>>`, capacity one/latest-value. Reload consumes discovery/template snapshots; signaller consumes frontend snapshots. Management reads all states. No unbounded event channels exist.
+Tokio runs independent frontend/backend watchers, template polling, the optional CachePolicy controller, reload, child supervision, management/probing, and optional signaller tasks. Each producer publishes immutable snapshots through `watch<Option<T>>`, capacity one/latest-value. Reload consumes discovery/template/policy snapshots; signaller consumes frontend snapshots. The controller consumes `Active` to learn which policy generations are live. Policies never gate startup: until the controller publishes, the VCL is headers-only. Management reads all states. No unbounded event channels exist.
 
 Each watcher selects `kubernetes.io/service-name`, matches TCP named ports, and merges by normalized `(IP,port)`. Accept `ready != false` and `terminating != true`; deduplicate and sort numerically. Reject invalid addresses/ports. Relists replace the complete store atomically; partial lists never erase healthy state. Watch expiration relists; errors retain snapshots and retry with 0.5–30s exponential full jitter. API requests time out after 30s; watches reconnect after 300s.
 
@@ -54,7 +57,7 @@ Serving fails open; configuration changes fail closed. Readiness is 200 exactly 
 
 ## CLI contract
 
-CLI overrides environment, then profile defaults. List-valued flags are comma-separated; repeated flags append. Storage is one opaque value, not a list. Boolean flags accept explicit true/false. Durations use `ms`, `s`, `m`. `—` means absent.
+CLI overrides environment, then the `--config` file, then profile defaults. List-valued flags are comma-separated; repeated flags append. Storage is one opaque value, not a list. Boolean flags accept explicit true/false. Durations use `ms`, `s`, `m`. `—` means absent.
 
 | Flag | Environment | Default |
 |---|---|---|
@@ -105,8 +108,15 @@ CLI overrides environment, then profile defaults. List-valued flags are comma-se
 | `--uncacheable-ttl` | `STALEWISE_UNCACHEABLE_TTL` | 30s |
 | `--max-object-size` | `STALEWISE_MAX_OBJECT_SIZE` | 10485760 bytes |
 | `--log-level` | `STALEWISE_LOG_LEVEL` | info |
+| `--config` | `STALEWISE_CONFIG` | —; YAML file, see below |
+| `--cache-policies` | `STALEWISE_CACHE_POLICIES` | false; conflicts with `--template` |
+| `--policy-service` | `STALEWISE_POLICY_SERVICE` | origin Service, or first label of a static origin host |
+| `--validate-attachment` | `STALEWISE_VALIDATE_ATTACHMENT` | value of `--cache-policies` |
+| `--cache-source-labels` | `STALEWISE_CACHE_SOURCE_LABELS` | empty key=value list; required with attachment validation |
 
-`--help`/`--version` are informational, without environment equivalents. No `--config` in v0.1.
+`--help`/`--version` are informational, without environment equivalents. `stalewise crd` prints the CachePolicy CRD.
+
+The config file is YAML (serde_norway) with `apiVersion: stalewise.dev/v1alpha1` and `kind: Config`. Other keys are flag names in camelCase; values are scalars or lists of scalars. A file value applies only where neither the CLI nor the environment set the flag, and then passes through the same validation. Unknown keys, nested maps and header mismatches fail startup with the file path. Raw templates remain the expert mode.
 
 `--profile=mesh` expands to static backend discovery, mesh template, wildcard frontend binding, and asynchronous peers. Explicit settings override these defaults. Reject conflicting static/watch inputs, invalid authorities/CIDRs, nonpositive limits, and backend host equal to the cache traffic Service host. Chart `cache.enabled=true` derives required identity settings; users need no additional cache policy.
 
@@ -126,6 +136,8 @@ The [official CLI protocol](https://www.varnish.org/docs/reference/cli_protocol/
 
 ## Dependencies
 
+v0.2 adds kube's `derive` feature, schemars 1.2.3 (CRD schema), serde_json 1.0.154 (unstructured VirtualServices, status patches), serde_norway 0.9.42 (config file, CRD output), and k8s-openapi's `schemars` feature.
+
 Verified crates.io `max_stable_version` and feature/dependency responses on 2026-11-07 using Python urllib GET with `User-Agent: stalewise-design/0.1 (dependency research)`.
 
 Reproduce: `curl -H 'User-Agent: stalewise-design/0.1 (dependency research)' https://crates.io/api/v1/crates/<name>`.
@@ -133,7 +145,7 @@ Reproduce: `curl -H 'User-Agent: stalewise-design/0.1 (dependency research)' htt
 | Exact version | Purpose/features |
 |---|---|
 | tokio 1.54.1 | runtime, net, process, signal, sync, time, fs, io-util, macros |
-| kube 5.0.0 | client/runtime/rustls-tls/ring; no derive |
+| kube 5.0.0 | client/runtime/derive/rustls-tls/ring |
 | k8s-openapi 0.29.0 | `v1_33`; supported baseline Kubernetes 1.33 |
 | hyper 1.12.0 | HTTP/1 server/client |
 | hyper-util 0.1.21 | Tokio I/O adapter |
@@ -162,13 +174,17 @@ Uncacheable responses become configurable 30s hit-for-miss objects; already-wait
 
 Tag headers enable host-scoped BAN with validated tokens, never arbitrary ban expressions. v0.2 introduces namespaced `stalewise.dev/v1alpha1 CachePolicy`: Service/path selection, typed overrides, bypass rules, and Accepted/Invalid status. Unset fields inherit headers; most-specific path wins; equal-specificity conflicts are rejected. Invalid changes preserve active VCL. Any application chart can include a CachePolicy template. Reject annotations for weak validation/status; reject central values for wrong ownership. Headers-only remains the default, not the only future policy source.
 
+### v0.2 policy rendering
+
+The controller validates every policy for its own Service, keeps the last accepted spec of a policy whose new generation is invalid, drops every policy that shares a normalized prefix with another, and orders the rest longest prefix first. Each rendered policy gets a numeric tag. `vcl_recv` matches `req.url` on segment boundaries, applies bypass rules, method limits, cookie stripping and the query allow-list key; `vcl_backend_response` matches `bereq.url` again and applies TTL, grace, keep, status and size overrides beside the header logic. Internal headers carrying the tag never reach the origin or the client. Policy output joins the same single-writer reload path, so a candidate that fails compilation leaves the active VCL in place and the policy stays `Accepted=False/Pending`.
+
 ## Traffic attachment: how a service opts into caching
 
 An application chart owns one cache Deployment and its existing VirtualService. Enabling caching forces that VirtualService to render. Its ordered rules are: cache source labels → normal destinations; `x-stalewise-bypass: true` → normal; GET/HEAD → cache; everything else → normal. Omitted methods/pathPrefixes mean every GET/HEAD. [Attachment ADR](adr/0003-traffic-attachment.md) contains exact YAML.
 
 This preserves origin canary weights/retries on misses. Hits ignore those weights; bypass canary tests or add a version key later. Every routed request pays a mesh hop, including uncacheable responses. Path restrictions only avoid that cost. A counter recording rule approximates pass/hit-for-miss share per service.
 
-v0.2 validates attachment status; stalewise never creates/edits VirtualServices. Source-label bypass requires sidecars; use a separate direct Service otherwise. Ingress HTTPRoute attachment is separate: explicitly target the cache Service. Without mesh routing, callers explicitly use cache DNS. Backend sidecars remain a latency-focused alternative; reject client sidecars and unsupported cache-filter plumbing. Shared Host-routed tiers come later. Removing attachment restores direct traffic after route propagation, without client changes.
+v0.2 validates attachment status; stalewise never creates/edits VirtualServices. It reads `networking.istio.io/v1` VirtualServices as unstructured objects, evaluates synthetic cache-sourced, bypass-header and plain GET/HEAD requests against the HTTP rules in order, and reports the first failure. Match conditions it cannot evaluate (regex, query parameters, other headers) never count as matching. Source-label bypass requires sidecars; use a separate direct Service otherwise. Ingress HTTPRoute attachment is separate: explicitly target the cache Service. Without mesh routing, callers explicitly use cache DNS. Backend sidecars remain a latency-focused alternative; reject client sidecars and unsupported cache-filter plumbing. Shared Host-routed tiers come later. Removing attachment restores direct traffic after route propagation, without client changes.
 
 ## Metrics and exporter
 

@@ -22,8 +22,23 @@ Discovery, template and reload problems keep the pod ready and appear as `degrad
 ## Usage
 
 Every flag has an environment variable equivalent (`--backend-host` is `STALEWISE_BACKEND_HOST`).
-Command-line flags override environment variables, which override profile defaults.
 Run `stalewise --help` for the complete list.
+
+`--config` reads the same settings from a YAML file, with each flag name in camelCase.
+Precedence is command line, then environment, then the config file, then profile defaults.
+Unknown fields, nested values and a wrong `apiVersion` or `kind` are startup errors.
+
+```yaml
+apiVersion: stalewise.dev/v1alpha1
+kind: Config
+namespace: apps
+frontendService: catalog-cache-peers
+frontendServiceHost: catalog-cache.apps.svc.cluster.local
+backendService: catalog
+purgeAcl: [10.0.0.0/8]
+cachePolicies: true
+cacheSourceLabels: [app.kubernetes.io/name=stalewise, app.kubernetes.io/instance=catalog-cache]
+```
 
 Generic profile, watching the origin's EndpointSlices:
 
@@ -66,6 +81,56 @@ The embedded templates cache only what the origin's headers allow.
 - Responses whose `Content-Length` exceeds `--max-object-size` (default 10 MiB) stream without being stored.
 - `Surrogate-Key` and `Cache-Tag` values are indexed for tag invalidation and removed before delivery.
 
+## Cache policies
+
+With `--cache-policies`, stalewise watches `CachePolicy` resources (`stalewise.dev/v1alpha1`) in its namespace.
+It applies only policies whose `serviceRef` names the cached Service, which defaults to the origin Service and can be set with `--policy-service`.
+Fields you set override the matching header-derived setting; fields you omit keep header behaviour.
+An explicit `ttlSeconds: 0` means "do not store", which differs from leaving the field out.
+Privacy rules still win: `Set-Cookie`, `private`, `no-store`, `no-cache` and `Authorization` are never cacheable.
+
+```yaml
+apiVersion: stalewise.dev/v1alpha1
+kind: CachePolicy
+metadata:
+  name: catalog-api
+  namespace: apps
+spec:
+  serviceRef: {name: catalog, port: http}
+  pathPrefix: /api
+  overrides:
+    ttlSeconds: 60
+    graceSeconds: 30
+    cacheableStatusCodes: [200, 404]
+    key:
+      headers: [X-Application-Version]
+      queryAllowList: [page, locale]
+    cookies: {mode: stripListed, names: [analytics]}
+  bypass:
+    - pathPrefix: /api/account
+    - header: {name: X-Preview, exact: "true"}
+  attach:
+    methods: [GET, HEAD]
+    pathPrefixes: [/]
+```
+
+- Prefixes match on segment boundaries, so `/api` matches `/api/x` but not `/apix`.
+- The longest matching prefix wins, and only that policy applies.
+- Two policies with the same prefix are both rejected with reason `Conflict`.
+- Removing a query name or cookie from the key can mix personalised responses, so list only names that never change the body per user.
+- A rejected update keeps the last accepted generation of that policy in force.
+  The status shows the rejected `observedGeneration` and the enforced `activeGeneration`.
+
+The controller writes `Accepted` and `Invalid` conditions through the status subresource.
+`Accepted=True` appears only after a VCL that contains this generation becomes active.
+An invalid policy never replaces the active VCL.
+`--cache-policies` cannot be combined with `--template`: a raw template owns the whole policy.
+
+With `attach` set and `--validate-attachment` on (the default with `--cache-policies`), stalewise reads the application's VirtualServices and reports an `Attached` condition.
+Reasons include `Attached`, `NoVirtualService`, `MissingSourceBypass`, `MissingHeaderBypass`, `MissingCacheRoute`, `UnrestrictedCacheRoute` and `Loop`.
+stalewise never creates or changes a VirtualService, and a static check cannot prove that the data plane applied a route.
+Pass the cache pods' labels with `--cache-source-labels` so the check can match the source bypass rule.
+
 ## Invalidation
 
 Enable the signaller with `--signaller`, `--signaller-token-file` and `--pod-ip`.
@@ -103,9 +168,33 @@ It creates traffic, headless peer, and management Services, a namespaced Role fo
 Pods run as uid 1000 with a read-only root filesystem and emptyDir work volumes.
 
 ```sh
-helm install catalog-cache charts/stalewise --set backend.service=catalog
+helm install catalog-cache charts/stalewise --set backend.service=catalog --set fullnameOverride=catalog-cache
 helm install catalog-cache charts/stalewise -f charts/stalewise/values-mesh.yaml
 ```
+
+Resource names default to `<release>-stalewise`, so release `catalog-cache` creates the Service `catalog-cache-stalewise`.
+Set `fullnameOverride: catalog-cache` (as `values-mesh.yaml` does) to get the Service host `catalog-cache.apps.svc.cluster.local` that the reference VirtualService routes to.
+
+The chart installs the `CachePolicy` CRD from `crds/`.
+Set `cachePolicies.enabled=true` to enable the controller and its RBAC: read access to CachePolicies, `update` and `patch` on their status, and read access to VirtualServices while `cachePolicies.validateAttachment` is true.
+An application chart that depends on this chart ships its policies through `cachePolicies.policies`:
+
+```yaml
+stalewise:
+  fullnameOverride: catalog-cache
+  cachePolicies:
+    enabled: true
+    policies:
+      - name: catalog-api
+        spec:
+          serviceRef: {name: catalog}
+          pathPrefix: /api
+          overrides: {ttlSeconds: 60}
+          attach: {mode: route}
+```
+
+`scripts/chart-check.sh` renders the documented release and validates it with kubeconform.
+Regenerate the CRD after changing the Rust types with `cargo run -- crd > charts/stalewise/crds/cachepolicies.stalewise.dev.yaml`; a unit test fails while the committed file is stale.
 
 When `mesh.sidecar` and `signaller.enabled` are both true, the chart fails unless `mesh.authorizationPolicy` is also true.
 
@@ -123,6 +212,7 @@ Order the HTTP rules as follows:
 4. All other requests follow the existing routing unchanged.
 
 Use the complete reference VirtualService in [ADR 0003](docs/adr/0003-traffic-attachment.md#reference-virtualservice).
+It assumes release `catalog-cache` installed with `fullnameOverride: catalog-cache`.
 Copy the application's existing routes, retries and canary weights into rules 1, 2 and 4.
 To remove caching, delete the cache match and wait for route propagation before draining the cache.
 
@@ -164,6 +254,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo deny check
+scripts/chart-check.sh
 ```
 
 The integration tests run the real `varnish:9.1.0` image in Docker and are ignored by default:

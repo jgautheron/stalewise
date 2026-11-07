@@ -96,18 +96,18 @@ fn candidate(config: &ReloadConfig, inputs: &Inputs) -> Result<Candidate, Render
     if backends.is_empty() && !config.allow_empty_backends {
         return Ok(Candidate::Empty);
     }
-    let frontends = inputs
+    let peers = inputs
         .frontends
         .borrow()
         .as_ref()
-        .map(|d| Arc::clone(&d.endpoints))
+        .map(|d| Arc::clone(&d.peers))
         .unwrap_or_else(|| Arc::from([]));
     let policies = inputs
         .policies
         .borrow()
         .clone()
         .unwrap_or_else(|| Arc::from([]));
-    let context = Context::new(&config.settings, &frontends, &backends, &policies)?;
+    let context = Context::new(&config.settings, &peers, &backends, &policies)?;
     Ok(Candidate::Ready(
         render::render(&template.source, &context)?.into(),
         policies,
@@ -518,6 +518,7 @@ mod tests {
             .collect();
         Some(Discovery {
             endpoints: endpoints.into(),
+            peers: Arc::from([]),
             last_success: SystemTime::now(),
             error: None,
         })
@@ -537,6 +538,7 @@ mod tests {
                 probe_path: "/".into(),
                 uncacheable_ttl: Duration::from_secs(30),
                 max_object_size: 1,
+                shard: None,
             },
             max_vcls,
             allow_empty_backends: false,

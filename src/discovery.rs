@@ -10,10 +10,12 @@ use k8s_openapi::api::discovery::v1::{Endpoint as SliceEndpoint, EndpointSlice};
 use kube::Api;
 use kube::runtime::watcher::{self, Event};
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Role, RoleConfig};
 use crate::endpoint::{Endpoint, Host};
+use crate::membership::{self, Debouncer, Peer};
 use crate::metrics::Metrics;
 use crate::status::{Health, Reason};
 
@@ -34,7 +36,10 @@ pub enum DiscoveryError {
 /// One complete, merged snapshot of a role's endpoints.
 #[derive(Debug, Clone)]
 pub struct Discovery {
+    /// Frontend endpoints follow `peers` order; origin endpoints are sorted numerically.
     pub endpoints: Arc<[Endpoint]>,
+    /// Stable cache-peer membership; empty for the origin role.
+    pub peers: Arc<[Peer]>,
     pub last_success: SystemTime,
     pub error: Option<DiscoveryError>,
 }
@@ -104,7 +109,7 @@ fn pod_key(endpoint: &SliceEndpoint) -> Option<String> {
 }
 
 /// The named TCP port of a slice, if it exposes one.
-fn slice_port(slice: &EndpointSlice, name: &str) -> Result<Option<u16>, DiscoveryError> {
+pub(crate) fn slice_port(slice: &EndpointSlice, name: &str) -> Result<Option<u16>, DiscoveryError> {
     let found = slice.ports.iter().flatten().find(|p| {
         p.name.as_deref() == Some(name) && p.protocol.as_deref().unwrap_or("TCP") == "TCP"
     });
@@ -186,10 +191,11 @@ impl Backoff {
 }
 
 /// Watches one Service's EndpointSlices until `stop`; errors retain the last snapshot and a
-/// finished stream is reopened, so the task returns only on `stop`.
+/// finished stream is reopened, so the task returns only on `stop`. Frontend membership is debounced.
 pub async fn watch(
     client: kube::Client,
     role: RoleConfig,
+    debounce: Duration,
     out: watch::Sender<Option<Discovery>>,
     metrics: Arc<Metrics>,
     health: Health,
@@ -203,10 +209,24 @@ pub async fn watch(
     let mut stream = watcher::watcher(api.clone(), config.clone()).boxed();
     let mut store = SliceStore::default();
     let mut backoff = Backoff::default();
+    let mut members = (role.role == Role::Frontend).then(|| Debouncer::new(debounce));
+    let sink = Sink {
+        role: &role,
+        out: &out,
+        metrics: &metrics,
+        health: &health,
+    };
     let labels = Metrics::role(role.role);
     loop {
+        let deadline = members.as_ref().and_then(Debouncer::deadline);
         let item = tokio::select! {
             () = stop.cancelled() => return,
+            () = sleep_until(deadline) => {
+                if let Some(peers) = members.as_mut().and_then(|d| d.poll(Instant::now())) {
+                    sink.send_peers(peers);
+                }
+                continue;
+            }
             item = stream.next() => item,
         };
         match item {
@@ -214,12 +234,12 @@ pub async fn watch(
                 metrics.discovery_events.get_or_create(&labels).inc();
                 backoff.reset();
                 if store.apply(event) {
-                    publish(&role, &store, &out, &metrics, &health);
+                    sink.publish(&store, members.as_mut());
                 }
             }
             Some(Err(err)) => {
                 metrics.discovery_errors.get_or_create(&labels).inc();
-                report_error(&role, &out, &health, DiscoveryError::Watch(err.to_string()));
+                sink.report_error(DiscoveryError::Watch(err.to_string()));
                 tokio::select! {
                     () = stop.cancelled() => return,
                     () = tokio::time::sleep(backoff.next_delay()) => {}
@@ -240,6 +260,13 @@ pub async fn watch(
     }
 }
 
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn discovery_reason(role: Role) -> Reason {
     match role {
         Role::Frontend => Reason::FrontendDiscovery,
@@ -247,57 +274,99 @@ fn discovery_reason(role: Role) -> Reason {
     }
 }
 
-fn report_error(
-    role: &RoleConfig,
-    out: &watch::Sender<Option<Discovery>>,
-    health: &Health,
-    err: DiscoveryError,
-) {
-    tracing::warn!(role = role.role.as_str(), error = %err, "discovery error; keeping last snapshot");
-    health.set(discovery_reason(role.role), true);
-    out.send_if_modified(|current| match current {
-        Some(snapshot) => {
-            snapshot.error = Some(err);
-            true
-        }
-        None => false,
-    });
+/// Where one watcher publishes snapshots, errors and metrics.
+struct Sink<'a> {
+    role: &'a RoleConfig,
+    out: &'a watch::Sender<Option<Discovery>>,
+    metrics: &'a Metrics,
+    health: &'a Health,
 }
 
-fn publish(
-    role: &RoleConfig,
-    store: &SliceStore,
-    out: &watch::Sender<Option<Discovery>>,
-    metrics: &Metrics,
-    health: &Health,
-) {
-    let labels = Metrics::role(role.role);
-    let endpoints = match merge(&store.slices(), &role.port_name) {
-        Ok(endpoints) => endpoints,
-        Err(err) => return report_error(role, out, health, err),
-    };
-    let now = SystemTime::now();
-    let unix = now
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    metrics
-        .discovery_last_success
-        .get_or_create(&labels)
-        .set(unix.as_secs_f64());
-    metrics
-        .discovery_endpoints
-        .get_or_create(&labels)
-        .set(i64::try_from(endpoints.len()).unwrap_or(i64::MAX));
-    if endpoints.is_empty() {
-        metrics.empty_endpoints.get_or_create(&labels).inc();
-        tracing::warn!(role = role.role.as_str(), service = %role.service, "service has no ready endpoints");
+impl Sink<'_> {
+    fn report_error(&self, err: DiscoveryError) {
+        let role = self.role.role;
+        tracing::warn!(role = role.as_str(), error = %err, "discovery error; keeping last snapshot");
+        self.health.set(discovery_reason(role), true);
+        self.out.send_if_modified(|current| match current {
+            Some(snapshot) => {
+                snapshot.error = Some(err);
+                true
+            }
+            None => false,
+        });
     }
-    health.set(discovery_reason(role.role), false);
-    out.send_replace(Some(Discovery {
-        endpoints: endpoints.into(),
-        last_success: now,
-        error: None,
-    }));
+
+    /// Merges a synchronised store; frontend membership passes through the debouncer first.
+    fn publish(&self, store: &SliceStore, members: Option<&mut Debouncer>) {
+        let slices = store.slices();
+        let Some(members) = members else {
+            return match merge(&slices, &self.role.port_name) {
+                Ok(endpoints) => self.send(endpoints, Vec::new()),
+                Err(err) => self.report_error(err),
+            };
+        };
+        let peers = match membership::merge_peers(&slices, &self.role.port_name) {
+            Ok(peers) => peers,
+            Err(err) => return self.report_error(err),
+        };
+        let now = Instant::now();
+        members.observe(peers, now);
+        match members.poll(now) {
+            Some(peers) => self.send_peers(peers),
+            None => self.mark_synced(),
+        }
+    }
+
+    fn send_peers(&self, peers: Vec<Peer>) {
+        let endpoints = peers.iter().map(Peer::endpoint).collect();
+        self.send(endpoints, peers);
+    }
+
+    /// A successful sync whose membership change is still settling keeps the committed snapshot.
+    fn mark_synced(&self) {
+        let now = self.record_success();
+        self.out.send_if_modified(|current| match current {
+            Some(snapshot) => {
+                snapshot.error = None;
+                snapshot.last_success = now;
+                true
+            }
+            None => false,
+        });
+    }
+
+    fn record_success(&self) -> SystemTime {
+        let now = SystemTime::now();
+        let unix = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        self.metrics
+            .discovery_last_success
+            .get_or_create(&Metrics::role(self.role.role))
+            .set(unix.as_secs_f64());
+        self.health.set(discovery_reason(self.role.role), false);
+        now
+    }
+
+    fn send(&self, endpoints: Vec<Endpoint>, peers: Vec<Peer>) {
+        let role = self.role;
+        let labels = Metrics::role(role.role);
+        let now = self.record_success();
+        self.metrics
+            .discovery_endpoints
+            .get_or_create(&labels)
+            .set(i64::try_from(endpoints.len()).unwrap_or(i64::MAX));
+        if endpoints.is_empty() {
+            self.metrics.empty_endpoints.get_or_create(&labels).inc();
+            tracing::warn!(role = role.role.as_str(), service = %role.service, "service has no ready endpoints");
+        }
+        self.out.send_replace(Some(Discovery {
+            endpoints: endpoints.into(),
+            peers: peers.into(),
+            last_success: now,
+            error: None,
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -493,7 +562,13 @@ mod tests {
             port_name: "http".into(),
         };
         let (tx, rx) = watch::channel(None);
-        report_error(&role, &tx, &health, DiscoveryError::Watch("down".into()));
+        let sink = Sink {
+            role: &role,
+            out: &tx,
+            metrics: &metrics,
+            health: &health,
+        };
+        sink.report_error(DiscoveryError::Watch("down".into()));
         assert!(rx.borrow().is_none());
         let mut store = SliceStore::default();
         store.apply(Event::Init);
@@ -504,12 +579,68 @@ mod tests {
             json!([{"addresses": ["10.0.0.1"]}]),
         )));
         store.apply(Event::InitDone);
-        publish(&role, &store, &tx, &metrics, &health);
+        sink.publish(&store, None);
         assert!(health.current().is_empty());
-        report_error(&role, &tx, &health, DiscoveryError::Watch("down".into()));
+        sink.report_error(DiscoveryError::Watch("down".into()));
         let snap = rx.borrow().clone().unwrap();
         assert_eq!(snap.endpoints.len(), 1);
         assert!(snap.error.is_some());
         assert!(health.current().contains(&Reason::BackendDiscovery));
+    }
+
+    #[test]
+    fn frontend_publishes_debounced_peers_and_a_settling_sync_clears_errors() {
+        let metrics = Arc::new(Metrics::new());
+        let health = Health::new(Arc::clone(&metrics));
+        let role = RoleConfig {
+            role: Role::Frontend,
+            namespace: "apps".into(),
+            service: "cache-peers".into(),
+            port_name: "http".into(),
+        };
+        let (tx, rx) = watch::channel(None);
+        let sink = Sink {
+            role: &role,
+            out: &tx,
+            metrics: &metrics,
+            health: &health,
+        };
+        let pod = |name: &str, ip: &str| {
+            json!({"addresses": [ip], "conditions": {"ready": true},
+                   "targetRef": {"kind": "Pod", "namespace": "apps", "name": name}})
+        };
+        let mut members = Debouncer::new(Duration::from_secs(60));
+        let mut store = SliceStore::default();
+        store.apply(Event::Init);
+        store.apply(Event::InitApply(slice(
+            "a",
+            "IPv4",
+            http(8080),
+            json!([pod("b", "10.0.0.1"), pod("a", "10.0.0.2")]),
+        )));
+        store.apply(Event::InitDone);
+        sink.publish(&store, Some(&mut members));
+        let snap = rx.borrow().clone().unwrap();
+        let names: Vec<&str> = snap.peers.iter().map(|p| p.pod_name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert_eq!(
+            names_of(&snap.endpoints),
+            ["10.0.0.2:8080", "10.0.0.1:8080"]
+        );
+        sink.report_error(DiscoveryError::Watch("down".into()));
+        store.apply(Event::Apply(slice(
+            "a",
+            "IPv4",
+            http(8080),
+            json!([pod("a", "10.0.0.2")]),
+        )));
+        sink.publish(&store, Some(&mut members));
+        let snap = rx.borrow().clone().unwrap();
+        assert_eq!(snap.peers.len(), 2, "the removal is still settling");
+        assert!(snap.error.is_none());
+    }
+
+    fn names_of(endpoints: &[Endpoint]) -> Vec<String> {
+        endpoints.iter().map(Endpoint::authority).collect()
     }
 }

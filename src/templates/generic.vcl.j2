@@ -47,6 +47,17 @@ sub stalewise_select_backend {
 
 sub stalewise_origin_host {
 }
+{% if shard %}
+
+# A peer fallback retries here, so the origin is chosen again rather than inherited.
+sub stalewise_origin_backend {
+{% if backends %}
+    set bereq.backend = stalewise_origin.backend();
+{% else %}
+    set bereq.backend = stalewise_none;
+{% endif %}
+}
+{% endif %}
 
 sub stalewise_object_host {
     set beresp.http.X-Stalewise-Host = bereq.http.Host;

@@ -6,6 +6,7 @@ use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEn
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 
 use crate::config::Role;
@@ -61,6 +62,34 @@ pub enum DeliveryResult {
     Retried,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InvalidationResult {
+    Delivered,
+    Exhausted,
+}
+
+impl EncodeLabelValue for InvalidationResult {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), std::fmt::Error> {
+        let text = match self {
+            Self::Delivered => "delivered",
+            Self::Exhausted => "exhausted",
+        };
+        std::fmt::Write::write_str(encoder, text)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
+pub struct InvalidationLabels {
+    pub result: InvalidationResult,
+}
+
+type LatencyFamily = Family<InvalidationLabels, Histogram, fn() -> Histogram>;
+
+/// 10ms doubling to about 40s, covering the delivery deadline range.
+fn latency_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(0.01, 2.0, 13))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, EncodeLabelSet)]
 pub struct RoleLabels {
     pub role: RoleLabel,
@@ -101,6 +130,8 @@ pub struct Metrics {
     pub signaller_queue_depth: Gauge,
     pub signaller_deliveries: Family<ResultLabels, Counter>,
     pub signaller_exhausted: Counter,
+    pub invalidation_latency: LatencyFamily,
+    pub invalidation_peers_lagging: Gauge,
     pub ready: Gauge,
     pub degraded: Gauge,
     pub degradation_events: Family<ReasonLabels, Counter>,
@@ -130,6 +161,8 @@ impl Metrics {
             signaller_queue_depth: Gauge::default(),
             signaller_deliveries: Family::default(),
             signaller_exhausted: Counter::default(),
+            invalidation_latency: Family::new_with_constructor(latency_histogram),
+            invalidation_peers_lagging: Gauge::default(),
             ready: Gauge::default(),
             degraded: Gauge::default(),
             degradation_events: Family::default(),
@@ -204,6 +237,16 @@ impl Metrics {
             "signaller_exhausted_deliveries",
             "Deliveries abandoned at their deadline",
             m.signaller_exhausted.clone(),
+        );
+        r.register(
+            "invalidation_latency_seconds",
+            "Admission to final target completion, by result",
+            m.invalidation_latency.clone(),
+        );
+        r.register(
+            "invalidation_peers_lagging",
+            "Distinct peers with a retained pending or exhausted delivery",
+            m.invalidation_peers_lagging.clone(),
         );
         r.register("ready", "1 when /readyz returns 200", m.ready.clone());
         r.register(

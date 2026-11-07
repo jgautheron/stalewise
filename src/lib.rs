@@ -7,6 +7,8 @@ pub mod controller;
 pub mod discovery;
 pub mod endpoint;
 pub mod http;
+pub mod ledger;
+pub mod membership;
 pub mod metrics;
 pub mod mgmt;
 pub mod policy;

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -17,11 +17,17 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Method, SignalConfig};
+use crate::config::{self, Method, SignalConfig};
 use crate::discovery::Discovery;
 use crate::endpoint::Authority;
 use crate::http::{self, Body, Limits};
-use crate::metrics::{DeliveryResult, Metrics, ResultLabels, StatusClass, StatusLabels};
+use crate::ledger::{
+    ExhaustReason, History, InvalidationId, Outcome, Status, Target, pending_status,
+};
+use crate::metrics::{
+    DeliveryResult, InvalidationLabels, InvalidationResult, Metrics, ResultLabels, StatusClass,
+    StatusLabels,
+};
 
 const TOKEN_MIN: usize = 32;
 const TOKEN_MAX: usize = 256;
@@ -30,6 +36,13 @@ const HOST_HEADER: &str = "x-stalewise-host";
 const MAX_TAG: usize = 128;
 const RETRY_BASE_MS: u64 = 100;
 const RETRY_CAP_MS: u64 = 1000;
+const WAIT_HEADER: &str = "x-stalewise-wait";
+const POD_HEADER: &str = "x-stalewise-pod";
+const STATUS_PREFIX: &str = "/invalidations/";
+/// Longest synchronous wait a write or status request may ask for.
+pub const MAX_WAIT: Duration = Duration::from_secs(30);
+/// Retained target rows per queue slot.
+const ROWS_PER_SLOT: usize = 4;
 const HOP_BY_HOP: [&str; 9] = [
     "connection",
     "keep-alive",
@@ -103,6 +116,9 @@ pub struct Invalidation {
 #[derive(Debug)]
 pub struct Delivery {
     pub request: Arc<Invalidation>,
+    pub id: InvalidationId,
+    /// Index of this target in the invalidation's status rows.
+    pub slot: usize,
     pub peer: SocketAddr,
     /// Host header sent on the wire; the invalidation host travels in `X-Stalewise-Host`.
     pub authority: HeaderValue,
@@ -114,7 +130,51 @@ struct Intake {
     token: TokenDigest,
     peers: watch::Receiver<Option<Discovery>>,
     queue: mpsc::Sender<Delivery>,
+    ledger: Arc<Ledger>,
     metrics: Arc<Metrics>,
+}
+
+/// Invalidation history plus a version bump that wakes waiters on every transition.
+struct Ledger {
+    history: Mutex<History>,
+    changed: watch::Sender<u64>,
+    metrics: Arc<Metrics>,
+}
+
+impl Ledger {
+    fn lock(&self) -> MutexGuard<'_, History> {
+        self.history.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lookup(&self, id: InvalidationId) -> Option<Status> {
+        self.lock().lookup(id)
+    }
+
+    fn complete(&self, id: InvalidationId, slot: usize, outcome: Outcome) {
+        let (done, lagging) = {
+            let mut history = self.lock();
+            let done = history.complete(id, slot, outcome, Instant::now());
+            (done, history.lagging())
+        };
+        self.metrics.invalidation_peers_lagging.set(count(lagging));
+        if let Some(done) = done {
+            let result = if done.delivered {
+                InvalidationResult::Delivered
+            } else {
+                InvalidationResult::Exhausted
+            };
+            self.metrics
+                .invalidation_latency
+                .get_or_create(&InvalidationLabels { result })
+                .observe(done.latency.as_secs_f64());
+            tracing::info!(id = %id, delivered = done.delivered, "invalidation finished");
+        }
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+    }
+}
+
+fn count(n: usize) -> i64 {
+    i64::try_from(n).unwrap_or(i64::MAX)
 }
 
 /// Serves until `stop`, then drains accepted deliveries within their deadlines.
@@ -130,17 +190,33 @@ pub async fn serve(
         .map_err(SignallerError::Bind)?;
     tracing::info!(addr = %config.listen, "signaller listening");
     let (queue, rx) = mpsc::channel(config.queue);
-    let dispatcher = tokio::spawn(dispatch(rx, config.clone(), Arc::clone(&metrics)));
+    let ledger = Arc::new(Ledger {
+        history: Mutex::new(History::new(
+            config.history,
+            config.queue.saturating_mul(ROWS_PER_SLOT),
+        )),
+        changed: watch::Sender::new(0),
+        metrics: Arc::clone(&metrics),
+    });
+    let dispatcher = tokio::spawn(dispatch(
+        rx,
+        config.clone(),
+        Arc::clone(&ledger),
+        stop.clone(),
+    ));
     let limits = Limits {
         header_timeout: config.header_timeout,
-        connection_timeout: (config.header_timeout + config.read_timeout + config.write_timeout)
-            .min(config.idle_timeout),
+        connection_timeout: config.header_timeout
+            + config.read_timeout
+            + MAX_WAIT
+            + config.write_timeout,
     };
     let intake = Arc::new(Intake {
         config,
         token,
         peers,
         queue,
+        ledger,
         metrics,
     });
     http::serve(
@@ -155,10 +231,9 @@ pub async fn serve(
 }
 
 async fn handle(intake: Arc<Intake>, req: Request<Incoming>) -> Response<Body> {
-    let response = match admit(&intake, req).await {
-        Ok(()) => http::text(StatusCode::ACCEPTED, "accepted for delivery\n"),
-        Err(rejection) => rejection.response(&intake.config.methods),
-    };
+    let response = route(&intake, req)
+        .await
+        .unwrap_or_else(|rejection| rejection.response(&intake.config.methods));
     let class = StatusClass::of(response.status().as_u16());
     intake
         .metrics
@@ -170,15 +245,134 @@ async fn handle(intake: Arc<Intake>, req: Request<Incoming>) -> Response<Body> {
     response
 }
 
+/// Authentication precedes everything; GET reads status, configured methods invalidate.
+async fn route(intake: &Intake, req: Request<Incoming>) -> Result<Response<Body>, Rejection> {
+    authorize(&intake.token, req.headers())?;
+    if req.method() == HttpMethod::GET {
+        return status(intake, &req).await;
+    }
+    let method = allowed(&intake.config.methods, req.method())?;
+    let wait = header_wait(req.headers())?;
+    let admitted = admit(intake, method, req).await?;
+    let Some(limit) = wait else {
+        return Ok(status_response(intake, &admitted, StatusCode::ACCEPTED));
+    };
+    let finished = wait_for(&intake.ledger, admitted, limit).await;
+    Ok(status_response(intake, &finished, wait_code(&finished)))
+}
+
+async fn status(intake: &Intake, req: &Request<Incoming>) -> Result<Response<Body>, Rejection> {
+    let id = status_id(req.uri().path())?;
+    let wait = query_wait(req.uri().query())?;
+    let current = intake.ledger.lookup(id).ok_or(Rejection::NotFound)?;
+    let Some(limit) = wait else {
+        return Ok(status_response(intake, &current, StatusCode::OK));
+    };
+    let finished = wait_for(&intake.ledger, current, limit).await;
+    Ok(status_response(intake, &finished, wait_code(&finished)))
+}
+
+fn wait_code(status: &Status) -> StatusCode {
+    if status.all_delivered() {
+        StatusCode::OK
+    } else {
+        StatusCode::GATEWAY_TIMEOUT
+    }
+}
+
+fn status_id(path: &str) -> Result<InvalidationId, Rejection> {
+    let raw = path
+        .strip_prefix(STATUS_PREFIX)
+        .ok_or(Rejection::NotFound)?;
+    raw.parse()
+        .map_err(|()| Rejection::BadRequest("malformed invalidation id\n"))
+}
+
+const BAD_WAIT: Rejection = Rejection::BadRequest("wait must be one duration from 1ms to 30s\n");
+
+/// A positive `ms`/`s`/`m` duration of at most [`MAX_WAIT`].
+pub fn parse_wait(raw: &str) -> Option<Duration> {
+    config::parse_duration(raw)
+        .ok()
+        .filter(|d| !d.is_zero() && *d <= MAX_WAIT)
+}
+
+fn header_wait(headers: &HeaderMap) -> Result<Option<Duration>, Rejection> {
+    let mut values = headers.get_all(WAIT_HEADER).iter();
+    match (values.next(), values.next()) {
+        (None, _) => Ok(None),
+        (Some(value), None) => value
+            .to_str()
+            .ok()
+            .and_then(parse_wait)
+            .map(Some)
+            .ok_or(BAD_WAIT),
+        _ => Err(BAD_WAIT),
+    }
+}
+
+/// The status query accepts exactly one `wait` control and nothing else.
+fn query_wait(query: Option<&str>) -> Result<Option<Duration>, Rejection> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    query
+        .strip_prefix("wait=")
+        .filter(|raw| !raw.contains('&'))
+        .and_then(parse_wait)
+        .map(Some)
+        .ok_or(BAD_WAIT)
+}
+
+/// Returns once every target is terminal or `limit` passes; never cancels delivery.
+async fn wait_for(ledger: &Ledger, initial: Status, limit: Duration) -> Status {
+    let deadline = Instant::now() + limit;
+    let mut changes = ledger.changed.subscribe();
+    let mut current = initial;
+    loop {
+        changes.borrow_and_update();
+        if let Some(latest) = ledger.lookup(current.id) {
+            current = latest;
+        }
+        if current.finished() {
+            return current;
+        }
+        match tokio::time::timeout_at(deadline, changes.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return current,
+        }
+    }
+}
+
+fn status_response(intake: &Intake, status: &Status, code: StatusCode) -> Response<Body> {
+    let body = serde_json::to_vec(status).unwrap_or_default();
+    let mut response = http::text(code, body);
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if let Ok(location) = HeaderValue::from_str(&format!("{STATUS_PREFIX}{}", status.id)) {
+        headers.insert(header::LOCATION, location);
+    }
+    if let Ok(pod) = HeaderValue::from_str(&intake.config.pod_name) {
+        headers.insert(HeaderName::from_static(POD_HEADER), pod);
+    }
+    response
+}
+
 /// Why a request was refused before admission; nothing is queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Rejection {
     Unauthorized,
     MethodNotAllowed,
     BadRequest(&'static str),
+    NotFound,
     TooLarge,
     Timeout,
     QueueFull,
+    HistoryFull,
 }
 
 impl Rejection {
@@ -187,16 +381,20 @@ impl Rejection {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized\n"),
             Self::MethodNotAllowed => (StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
             Self::BadRequest(why) => (StatusCode::BAD_REQUEST, why),
+            Self::NotFound => (StatusCode::NOT_FOUND, "unknown invalidation\n"),
             Self::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "body too large\n"),
             Self::Timeout => (StatusCode::REQUEST_TIMEOUT, "body read timed out\n"),
             Self::QueueFull => (StatusCode::SERVICE_UNAVAILABLE, "queue full\n"),
+            Self::HistoryFull => (StatusCode::SERVICE_UNAVAILABLE, "history full\n"),
         };
         let mut response = http::text(status, body);
         let headers = response.headers_mut();
         if self == Self::Unauthorized {
             headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         }
-        let allow: Vec<&str> = methods.iter().map(|m| m.as_str()).collect();
+        let allow: Vec<&str> = std::iter::once("GET")
+            .chain(methods.iter().map(|m| m.as_str()))
+            .collect();
         if let (Self::MethodNotAllowed, Ok(value)) =
             (self, HeaderValue::from_str(&allow.join(", ")))
         {
@@ -206,10 +404,12 @@ impl Rejection {
     }
 }
 
-async fn admit(intake: &Intake, req: Request<Incoming>) -> Result<(), Rejection> {
+async fn admit(
+    intake: &Intake,
+    method: Method,
+    req: Request<Incoming>,
+) -> Result<Status, Rejection> {
     let config = &intake.config;
-    authorize(&intake.token, req.headers())?;
-    let method = allowed(&config.methods, req.method())?;
     let (parts, body) = req.into_parts();
     let path = origin_form(&parts.uri)?;
     let host = target_host(config.canonical_host.as_ref(), &parts.headers)?;
@@ -361,6 +561,7 @@ pub fn forwardable(headers: &HeaderMap) -> HeaderMap {
         let dropped = HOP_BY_HOP.contains(&lower)
             || nominated.contains(lower)
             || name == header::AUTHORIZATION
+            || lower == WAIT_HEADER
             || name == header::HOST
             || name == header::CONTENT_LENGTH;
         if !dropped {
@@ -370,45 +571,65 @@ pub fn forwardable(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-/// Every discovered peer except this pod, plus the local frontend; deduplicated.
-pub fn targets(config: &SignalConfig, snapshot: &Option<Discovery>) -> Vec<SocketAddr> {
-    let mut set: BTreeSet<SocketAddr> = snapshot
-        .iter()
-        .flat_map(|d| d.endpoints.iter())
-        .filter_map(|e| match e.host {
-            crate::endpoint::Host::Ip(ip) if !config.pod_ips.contains(&ip) => {
-                Some(SocketAddr::new(ip, e.port))
-            }
-            _ => None,
-        })
-        .collect();
-    set.insert(config.local_frontend);
-    set.into_iter().collect()
+/// The local frontend, then every discovered peer except this pod; frozen at admission.
+pub fn targets(config: &SignalConfig, snapshot: &Option<Discovery>) -> Vec<Target> {
+    let mut out = vec![Target {
+        pod: Some(config.pod_name.clone()),
+        addr: config.local_frontend,
+    }];
+    let peers = snapshot.iter().flat_map(|d| d.peers.iter());
+    for peer in peers {
+        let addr = SocketAddr::new(peer.address, peer.port);
+        let own = peer.pod_name == config.pod_name || config.pod_ips.contains(&peer.address);
+        if own || out.iter().any(|t| t.addr == addr) {
+            continue;
+        }
+        out.push(Target {
+            pod: Some(peer.pod_name.clone()),
+            addr,
+        });
+    }
+    out
 }
 
+/// Reserves history and queue capacity together; on any shortfall nothing is recorded or queued.
 fn enqueue(
     intake: &Intake,
     request: Arc<Invalidation>,
-    peers: &[SocketAddr],
-) -> Result<(), Rejection> {
+    targets: &[Target],
+) -> Result<Status, Rejection> {
+    let id = InvalidationId::random();
+    let status = pending_status(id, &intake.config.pod_name, targets);
+    let mut history = intake.ledger.lock();
+    let victims = history.plan(targets.len()).ok_or(Rejection::HistoryFull)?;
     let permits = intake
         .queue
-        .try_reserve_many(peers.len())
+        .try_reserve_many(targets.len())
         .map_err(|_| Rejection::QueueFull)?;
+    history.insert(&victims, status.clone(), Instant::now());
+    let lagging = history.lagging();
+    drop(history);
     let deadline = Instant::now() + intake.config.delivery_deadline;
-    for (permit, peer) in permits.zip(peers) {
+    for ((slot, target), permit) in targets.iter().enumerate().zip(permits) {
         permit.send(Delivery {
-            authority: wire_authority(&intake.config, *peer, &request.host),
+            authority: wire_authority(&intake.config, target.addr, &request.host),
             request: Arc::clone(&request),
-            peer: *peer,
+            id,
+            slot,
+            peer: target.addr,
             deadline,
         });
     }
     intake
         .metrics
+        .invalidation_peers_lagging
+        .set(count(lagging));
+    intake
+        .metrics
         .signaller_queue_depth
         .set(queue_depth(&intake.queue));
-    Ok(())
+    tracing::info!(id = %id, targets = targets.len(), "invalidation admitted");
+    Ok(status)
 }
 
 fn queue_depth(queue: &mpsc::Sender<Delivery>) -> i64 {
@@ -416,7 +637,13 @@ fn queue_depth(queue: &mpsc::Sender<Delivery>) -> i64 {
 }
 
 /// Owns the receiver and runs at most `workers` deliveries at once until the queue closes.
-async fn dispatch(mut rx: mpsc::Receiver<Delivery>, config: SignalConfig, metrics: Arc<Metrics>) {
+async fn dispatch(
+    mut rx: mpsc::Receiver<Delivery>,
+    config: SignalConfig,
+    ledger: Arc<Ledger>,
+    stop: CancellationToken,
+) {
+    let metrics = Arc::clone(&ledger.metrics);
     let slots = Arc::new(Semaphore::new(config.workers));
     let tracker = tokio_util::task::TaskTracker::new();
     while let Some(delivery) = rx.recv().await {
@@ -425,10 +652,13 @@ async fn dispatch(mut rx: mpsc::Receiver<Delivery>, config: SignalConfig, metric
         let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
             break;
         };
-        let metrics = Arc::clone(&metrics);
+        let ledger = Arc::clone(&ledger);
+        let stop = stop.clone();
         let timeout = config.peer_timeout;
         tracker.spawn(async move {
-            deliver(delivery, timeout, &metrics).await;
+            let (id, slot) = (delivery.id, delivery.slot);
+            let outcome = deliver(delivery, timeout, &ledger.metrics, &stop).await;
+            ledger.complete(id, slot, outcome);
             drop(permit);
         });
     }
@@ -436,28 +666,34 @@ async fn dispatch(mut rx: mpsc::Receiver<Delivery>, config: SignalConfig, metric
     tracker.wait().await;
 }
 
-enum Outcome {
+enum Attempt {
     Delivered,
     Rejected,
     Retry,
 }
 
-fn classify(result: &Result<StatusCode, http::ClientError>) -> Outcome {
+fn classify(result: &Result<StatusCode, http::ClientError>) -> Attempt {
     match result {
-        Ok(s) if s.is_success() => Outcome::Delivered,
+        Ok(s) if s.is_success() => Attempt::Delivered,
         Ok(s)
             if *s == StatusCode::REQUEST_TIMEOUT
                 || *s == StatusCode::TOO_MANY_REQUESTS
                 || s.is_server_error() =>
         {
-            Outcome::Retry
+            Attempt::Retry
         }
-        Ok(_) => Outcome::Rejected,
-        Err(_) => Outcome::Retry,
+        Ok(_) => Attempt::Rejected,
+        Err(_) => Attempt::Retry,
     }
 }
 
-async fn deliver(delivery: Delivery, peer_timeout: Duration, metrics: &Metrics) {
+/// Retries transient failures until the admission deadline; returns the target's terminal state.
+async fn deliver(
+    delivery: Delivery,
+    peer_timeout: Duration,
+    metrics: &Metrics,
+    stop: &CancellationToken,
+) -> Outcome {
     let count = |result| {
         metrics
             .signaller_deliveries
@@ -469,8 +705,13 @@ async fn deliver(delivery: Delivery, peer_timeout: Duration, metrics: &Metrics) 
         let remaining = delivery.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             metrics.signaller_exhausted.inc();
-            tracing::warn!(peer = %delivery.peer, "invalidation delivery exhausted at its deadline");
-            return;
+            let reason = if stop.is_cancelled() {
+                ExhaustReason::Shutdown
+            } else {
+                ExhaustReason::Deadline
+            };
+            tracing::warn!(id = %delivery.id, peer = %delivery.peer, reason = ?reason, "invalidation delivery exhausted");
+            return Outcome::Exhausted(reason);
         }
         let result = http::send(
             delivery.peer,
@@ -479,12 +720,16 @@ async fn deliver(delivery: Delivery, peer_timeout: Duration, metrics: &Metrics) 
         )
         .await;
         match classify(&result) {
-            Outcome::Delivered => return count(DeliveryResult::Delivered),
-            Outcome::Rejected => {
-                tracing::warn!(peer = %delivery.peer, status = ?result.ok(), "peer rejected invalidation");
-                return count(DeliveryResult::Rejected);
+            Attempt::Delivered => {
+                count(DeliveryResult::Delivered);
+                return Outcome::Delivered;
             }
-            Outcome::Retry => count(DeliveryResult::Retried),
+            Attempt::Rejected => {
+                tracing::warn!(id = %delivery.id, peer = %delivery.peer, status = ?result.ok(), "peer rejected invalidation");
+                count(DeliveryResult::Rejected);
+                return Outcome::Exhausted(ExhaustReason::Rejected);
+            }
+            Attempt::Retry => count(DeliveryResult::Retried),
         }
         let ceiling = RETRY_BASE_MS
             .saturating_mul(2u64.saturating_pow(attempt))
@@ -514,7 +759,8 @@ fn build(inv: &Invalidation, authority: &HeaderValue) -> Request<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoint::{Endpoint, Host};
+    use crate::endpoint::Endpoint;
+    use crate::membership::Peer;
     use std::net::IpAddr;
     use std::sync::Mutex;
     use std::time::SystemTime;
@@ -567,6 +813,8 @@ mod tests {
     fn config(local: SocketAddr, queue: usize, deadline: Duration) -> SignalConfig {
         SignalConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
+            pod_name: "cache-0".into(),
+            history: 16,
             token_file: "/unused".into(),
             pod_ips: vec!["10.9.9.9".parse().unwrap(), "fd00::9".parse().unwrap()],
             local_frontend: local,
@@ -586,12 +834,20 @@ mod tests {
     }
 
     fn snapshot(addrs: &[SocketAddr]) -> Option<Discovery> {
-        let endpoints: Vec<Endpoint> = addrs
+        let peers: Vec<Peer> = addrs
             .iter()
-            .map(|a| Endpoint::new(Host::Ip(a.ip()), a.port()))
+            .enumerate()
+            .map(|(i, a)| Peer {
+                pod_name: format!("peer-{i}"),
+                namespace: "apps".into(),
+                address: a.ip(),
+                port: a.port(),
+            })
             .collect();
+        let endpoints: Vec<Endpoint> = peers.iter().map(Peer::endpoint).collect();
         Some(Discovery {
             endpoints: endpoints.into(),
+            peers: peers.into(),
             last_success: SystemTime::now(),
             error: None,
         })
@@ -698,7 +954,10 @@ mod tests {
         let own_v4 = SocketAddr::new(cfg.pod_ips[0], 8080);
         let own_v6 = SocketAddr::new(cfg.pod_ips[1], 8080);
         let v6: SocketAddr = "[fd00::5]:8080".parse().unwrap();
-        let got = targets(&cfg, &snapshot(&[own_v4, own_v6, v6, v6]));
+        let got: Vec<SocketAddr> = targets(&cfg, &snapshot(&[own_v4, own_v6, v6, v6]))
+            .iter()
+            .map(|t| t.addr)
+            .collect();
         assert_eq!(got, [local, v6]);
         assert_eq!(v6.to_string(), "[fd00::5]:8080");
         assert!(matches!(v6.ip(), IpAddr::V6(_)));
@@ -747,10 +1006,10 @@ mod tests {
         assert!(raw(s.addr, &wrong).await.starts_with("HTTP/1.1 401"));
         let dup = purge(&format!("Authorization: Bearer {TOKEN}\r\n"));
         assert!(raw(s.addr, &dup).await.starts_with("HTTP/1.1 401"));
-        let get = purge("").replacen("PURGE", "GET", 1);
-        let resp = raw(s.addr, &get).await;
+        let delete = purge("").replacen("PURGE", "DELETE", 1);
+        let resp = raw(s.addr, &delete).await;
         assert!(resp.starts_with("HTTP/1.1 405"));
-        assert!(resp.to_ascii_lowercase().contains("allow: purge, ban"));
+        assert!(resp.to_ascii_lowercase().contains("allow: get, purge, ban"));
         let big = purge("").replace("Content-Length: 0", "Content-Length: 65");
         assert!(raw(s.addr, &big).await.starts_with("HTTP/1.1 413"));
         let chunked = purge("Transfer-Encoding: chunked\r\n").replace("Content-Length: 0\r\n", "")
@@ -864,5 +1123,236 @@ mod tests {
         eventually(|| seen.lock().unwrap().len() == 1).await;
         s.stop.cancel();
         s.task.await.unwrap().unwrap();
+    }
+
+    fn header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
+        let head = response.split("\r\n\r\n").next()?;
+        head.lines().find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    fn json(response: &str) -> serde_json::Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or("");
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn states(response: &str) -> Vec<(String, String)> {
+        json(response)["peers"]
+            .as_array()
+            .map(|peers| {
+                peers
+                    .iter()
+                    .map(|p| {
+                        let state = p["status"].as_str().unwrap_or_default().to_owned();
+                        let reason = p["reason"].as_str().unwrap_or("-").to_owned();
+                        (state, reason)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn get(path: &str, auth: bool) -> String {
+        let auth = if auth {
+            format!("Authorization: Bearer {TOKEN}\r\n")
+        } else {
+            String::new()
+        };
+        format!("GET {path} HTTP/1.1\r\nHost: s\r\n{auth}\r\n")
+    }
+
+    #[tokio::test]
+    async fn writes_return_a_receipt_whose_status_is_authenticated_and_pollable() {
+        let (local, _) = peer("127.0.0.1:0", vec![200]).await;
+        let s = start(config(local, 8, Duration::from_secs(2)), None).await;
+        let resp = raw(s.addr, &purge("")).await;
+        assert!(resp.starts_with("HTTP/1.1 202"), "{resp}");
+        let location = header(&resp, "location").unwrap().to_owned();
+        let id = location.strip_prefix("/invalidations/").unwrap();
+        assert_eq!(id.len(), 32);
+        assert_eq!(json(&resp)["id"], id);
+        assert_eq!(header(&resp, "x-stalewise-pod"), Some("cache-0"));
+        assert_eq!(header(&resp, "cache-control"), Some("no-store"));
+        assert_eq!(json(&resp)["peers"][0]["pod"], "cache-0");
+
+        let polled = raw(s.addr, &get(&format!("{location}?wait=2s"), true)).await;
+        assert!(polled.starts_with("HTTP/1.1 200"), "{polled}");
+        assert_eq!(states(&polled), [("delivered".to_owned(), "-".to_owned())]);
+        assert_eq!(header(&polled, "location"), Some(location.as_str()));
+
+        let unknown = format!("/invalidations/{}", "0".repeat(32));
+        assert!(
+            raw(s.addr, &get(&unknown, false))
+                .await
+                .starts_with("HTTP/1.1 401"),
+            "auth precedes lookup"
+        );
+        assert!(
+            raw(s.addr, &get(&unknown, true))
+                .await
+                .starts_with("HTTP/1.1 404")
+        );
+        assert!(
+            raw(s.addr, &get("/elsewhere", true))
+                .await
+                .starts_with("HTTP/1.1 404")
+        );
+        for bad in [
+            "/invalidations/xyz".to_owned(),
+            format!("{location}?wait=0s"),
+            format!("{location}?wait=31s"),
+            format!("{location}?wait=1s&wait=2s"),
+            format!("{location}?other=1"),
+            format!("{location}?wait=2"),
+        ] {
+            let resp = raw(s.addr, &get(&bad, true)).await;
+            assert!(resp.starts_with("HTTP/1.1 400"), "{bad}: {resp}");
+        }
+        s.stop.cancel();
+        s.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronous_writes_wait_for_every_target_and_never_forward_the_control() {
+        let (local, local_seen) = peer("127.0.0.1:0", vec![200]).await;
+        let (remote, remote_seen) = peer("127.0.0.1:0", vec![200]).await;
+        let s = start(
+            config(local, 8, Duration::from_secs(2)),
+            snapshot(&[remote]),
+        )
+        .await;
+        let resp = raw(s.addr, &purge("X-Stalewise-Wait: 2s\r\n")).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert_eq!(states(&resp).len(), 2);
+        assert!(states(&resp).iter().all(|(state, _)| state == "delivered"));
+        assert_eq!(json(&resp)["peers"][1]["pod"], "peer-0");
+        let got = remote_seen.lock().unwrap()[0].clone();
+        assert_eq!(got.path, "/a?b=1", "the object query is untouched");
+        assert!(got.headers.get(WAIT_HEADER).is_none());
+        for bad in [
+            "X-Stalewise-Wait: 2\r\n",
+            "X-Stalewise-Wait: 31s\r\n",
+            "X-Stalewise-Wait: 1s\r\nX-Stalewise-Wait: 1s\r\n",
+        ] {
+            assert!(
+                raw(s.addr, &purge(bad)).await.starts_with("HTTP/1.1 400"),
+                "{bad}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            local_seen.lock().unwrap().len(),
+            1,
+            "rejected waits queue nothing"
+        );
+        s.stop.cancel();
+        s.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_reports_current_status_at_timeout_and_terminal_failures_with_reasons() {
+        let (local, _) = peer("127.0.0.1:0", vec![200]).await;
+        let (slow, _) = peer("127.0.0.1:0", vec![503]).await;
+        let s = start(
+            config(local, 8, Duration::from_millis(800)),
+            snapshot(&[slow]),
+        )
+        .await;
+        let resp = raw(s.addr, &purge("X-Stalewise-Wait: 200ms\r\n")).await;
+        assert!(resp.starts_with("HTTP/1.1 504"), "{resp}");
+        assert_eq!(states(&resp)[1], ("pending".to_owned(), "-".to_owned()));
+        let location = header(&resp, "location").unwrap().to_owned();
+        let done = raw(s.addr, &get(&format!("{location}?wait=5s"), true)).await;
+        assert!(
+            done.starts_with("HTTP/1.1 504"),
+            "an exhausted target never reports success"
+        );
+        assert_eq!(
+            states(&done)[1],
+            ("exhausted".to_owned(), "deadline".to_owned())
+        );
+        assert_eq!(s.metrics.invalidation_peers_lagging.get(), 1);
+        let metrics = s.metrics.encode().unwrap();
+        assert!(
+            metrics
+                .contains("stalewise_invalidation_latency_seconds_count{result=\"exhausted\"} 1"),
+            "{metrics}"
+        );
+        s.stop.cancel();
+        s.task.await.unwrap().unwrap();
+
+        let (local, _) = peer("127.0.0.1:0", vec![403]).await;
+        let s = start(config(local, 8, Duration::from_secs(5)), None).await;
+        let started = Instant::now();
+        let resp = raw(s.addr, &purge("X-Stalewise-Wait: 5s\r\n")).await;
+        assert!(resp.starts_with("HTTP/1.1 504"));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "terminal failures return early"
+        );
+        assert_eq!(
+            states(&resp)[0],
+            ("exhausted".to_owned(), "rejected".to_owned())
+        );
+        s.stop.cancel();
+        s.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_history_of_pending_work_rejects_new_writes_without_queueing() {
+        let (local, seen) = peer("127.0.0.1:0", vec![503]).await;
+        let mut cfg = config(local, 8, Duration::from_millis(600));
+        cfg.history = 1;
+        let s = start(cfg, None).await;
+        assert!(raw(s.addr, &purge("")).await.starts_with("HTTP/1.1 202"));
+        let full = raw(s.addr, &purge("")).await;
+        assert!(full.starts_with("HTTP/1.1 503"), "{full}");
+        assert!(full.contains("history full"));
+        eventually(|| s.metrics.signaller_exhausted.get() == 1).await;
+        let attempts = seen.lock().unwrap().len();
+        assert!(
+            raw(s.addr, &purge("")).await.starts_with("HTTP/1.1 202"),
+            "terminal records make room"
+        );
+        assert!(attempts >= 1);
+        s.stop.cancel();
+        s.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn deadline_reached_during_shutdown_is_reported_as_shutdown() {
+        let request = Arc::new(Invalidation {
+            method: HttpMethod::from_bytes(b"PURGE").unwrap(),
+            path: "/".into(),
+            host: HeaderValue::from_static("a"),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        });
+        let delivery = Delivery {
+            request,
+            id: InvalidationId::random(),
+            slot: 0,
+            peer: "127.0.0.1:9".parse().unwrap(),
+            authority: HeaderValue::from_static("a"),
+            deadline: Instant::now(),
+        };
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let outcome = deliver(delivery, Duration::from_millis(50), &Metrics::new(), &stop).await;
+        assert_eq!(outcome, Outcome::Exhausted(ExhaustReason::Shutdown));
+    }
+
+    #[test]
+    fn wait_durations_are_positive_and_capped() {
+        assert_eq!(parse_wait("30s"), Some(MAX_WAIT));
+        assert_eq!(parse_wait("1ms"), Some(Duration::from_millis(1)));
+        for bad in ["0ms", "31s", "1m", "", "5", "-1s"] {
+            assert_eq!(parse_wait(bad), None, "{bad}");
+        }
     }
 }

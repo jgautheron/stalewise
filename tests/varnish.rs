@@ -52,12 +52,13 @@ fn build_image_once() {
     });
 }
 
-/// Origin state: per-path hit counts, the last Host header seen, and paths forced to 500.
+/// Origin state: per-path hit counts, Host and raw targets seen, and paths forced to 500.
 #[derive(Default)]
 struct Origin {
     hits: HashMap<String, usize>,
     last_host: Option<String>,
     failing: HashSet<String>,
+    targets: Vec<(String, Option<String>)>,
 }
 
 type SharedOrigin = Arc<Mutex<Origin>>;
@@ -65,7 +66,27 @@ type SharedOrigin = Arc<Mutex<Origin>>;
 fn route(path: &str, n: usize) -> (StatusCode, Vec<(&'static str, String)>, String) {
     let body = format!("{path} #{n}");
     let cc = |v: &str| vec![("cache-control", v.to_owned())];
+    if ["/slow/", "/shard/", "/echo/", "/hop/", "/fb/"]
+        .iter()
+        .any(|p| path.starts_with(p))
+    {
+        return (StatusCode::OK, cc("max-age=60"), body);
+    }
+    if path.starts_with("/ltag/") {
+        let mut headers = cc("max-age=60");
+        headers.push(("surrogate-key", "gamma".into()));
+        return (StatusCode::OK, headers, body);
+    }
     match path {
+        "/spoofed" => (
+            StatusCode::OK,
+            vec![
+                ("cache-control", "max-age=60".into()),
+                ("x-stalewise-peer-ttl", "999".into()),
+                ("x-stalewise-peer-tags", ",forged,".into()),
+            ],
+            body,
+        ),
         "/cache" | "/" => (StatusCode::OK, cc("max-age=60"), body),
         "/stale" => (
             StatusCode::OK,
@@ -123,14 +144,19 @@ fn route(path: &str, n: usize) -> (StatusCode, Vec<(&'static str, String)>, Stri
 
 async fn origin_handler(origin: SharedOrigin, req: Request<Incoming>) -> Response<Body> {
     let path = req.uri().path().to_owned();
+    let target = req.uri().to_string();
     let host = req
         .headers()
         .get("host")
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned);
     let _ = req.into_body().collect().await;
+    if path.starts_with("/slow/") {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     let (n, failing) = {
         let mut o = origin.lock().unwrap();
+        o.targets.push((target, host.clone()));
         o.last_host = host;
         let failing = o.failing.contains(&path);
         let n = o.hits.entry(path.clone()).or_default();
@@ -325,6 +351,7 @@ fn base_args(origin_port: u16) -> Vec<String> {
         "--signaller",
         "--signaller-token-file=/config/token",
         "--pod-ip=10.255.255.1",
+        "--pod-name=cache-it",
         "--log-level=info",
     ]
     .iter()
@@ -582,11 +609,16 @@ impl Drop for Network {
     }
 }
 
-/// Minimal Kubernetes API: one EndpointSlice listing both peers; watches idle, then end.
+/// Minimal Kubernetes API: one EndpointSlice listing every peer Pod; watches idle, then end.
 async fn start_fake_kube(peers: &[&str]) -> u16 {
     let addresses: Vec<String> = peers
         .iter()
-        .map(|ip| format!(r#"{{"addresses":["{ip}"],"conditions":{{"ready":true}}}}"#))
+        .enumerate()
+        .map(|(i, ip)| {
+            format!(
+                r#"{{"addresses":["{ip}"],"conditions":{{"ready":true}},"targetRef":{{"kind":"Pod","namespace":"default","name":"cache-{i}"}}}}"#
+            )
+        })
         .collect();
     let list = format!(
         r#"{{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","metadata":{{"resourceVersion":"1"}},"items":[{{"metadata":{{"name":"cache-peers-x","namespace":"default","resourceVersion":"1","labels":{{"kubernetes.io/service-name":"cache-peers"}}}},"addressType":"IPv4","endpoints":[{}],"ports":[{{"name":"http","port":8080,"protocol":"TCP"}}]}}]}}"#,
@@ -631,18 +663,24 @@ fn kubeconfig(port: u16) -> String {
     )
 }
 
-fn peer_args(origin_port: u16, ip: &str) -> Vec<String> {
+fn peer_args(origin_port: u16, ip: &str, pod: &str) -> Vec<String> {
     base_args(origin_port)
         .into_iter()
-        .filter(|a| !a.starts_with("--pod-ip"))
+        .filter(|a| !a.starts_with("--pod-ip") && !a.starts_with("--pod-name"))
         .chain([
             format!("--pod-ip={ip}"),
+            format!("--pod-name={pod}"),
             format!("--peer-authority={PEER_AUTHORITY}"),
         ])
         .collect()
 }
 
 async fn run_peer(dir: &Path, network: &str, ip: &str, origin_port: u16) -> Container {
+    let pod = if ip == PEER_A { "cache-0" } else { "cache-1" };
+    run_peer_with(dir, network, ip, peer_args(origin_port, ip, pod)).await
+}
+
+async fn run_peer_with(dir: &Path, network: &str, ip: &str, args: Vec<String>) -> Container {
     let docker_extra: Vec<String> = [
         "--network",
         network,
@@ -654,7 +692,7 @@ async fn run_peer(dir: &Path, network: &str, ip: &str, origin_port: u16) -> Cont
     .iter()
     .map(|s| (*s).to_owned())
     .collect();
-    run_cache_with(dir, &docker_extra, &peer_args(origin_port, ip)).await
+    run_cache_with(dir, &docker_extra, &args).await
 }
 
 fn ttl_policies() -> Vec<stalewise::policy::RenderPolicy> {
@@ -703,6 +741,7 @@ fn rendered_policy_vcl(origin_port: u16) -> String {
         probe_path: "/".into(),
         uncacheable_ttl: Duration::from_secs(30),
         max_object_size: 10_485_760,
+        shard: None,
     };
     let origin = Endpoint::new(
         Host::Dns("host.docker.internal".parse().unwrap()),
@@ -826,4 +865,643 @@ async fn cache_policy_ttl_overrides_a_headerless_response_but_not_privacy() {
         );
         assert_eq!(hits(&origin, path), 2, "{path}");
     }
+}
+
+struct Cluster {
+    nodes: Vec<Container>,
+    ips: Vec<String>,
+    origin: SharedOrigin,
+    _network: Network,
+}
+
+/// Lines in the confirmed active VCL that add a peer to the ring.
+fn ring_size(c: &Container) -> usize {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            &c.id,
+            "grep",
+            "-c",
+            "add_backend(peer_",
+            "/var/lib/stalewise/run/active.vcl",
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Three sharded caches on one network, discovered through the fake API as cache-0..2.
+async fn start_cluster(name: &str, prefix: &str, extra: &[&str]) -> Cluster {
+    let (port, origin) = start_origin().await;
+    let ips: Vec<String> = (10..13).map(|n| format!("{prefix}.{n}")).collect();
+    let refs: Vec<&str> = ips.iter().map(String::as_str).collect();
+    let kube_port = start_fake_kube(&refs).await;
+    let dir = temp_dir(name);
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    std::fs::write(dir.join("kubeconfig"), kubeconfig(kube_port)).unwrap();
+    let net = format!("stalewise-it-{name}-{}", std::process::id());
+    docker(&[
+        "network",
+        "create",
+        "--subnet",
+        &format!("{prefix}.0/24"),
+        &net,
+    ]);
+    let network = Network(net);
+    let mut nodes = Vec::new();
+    for (i, ip) in ips.iter().enumerate() {
+        let mut args = peer_args(port, ip, &format!("cache-{i}"));
+        args.extend(
+            [
+                "--shard",
+                "--peer-timeout=1s",
+                "--membership-debounce=100ms",
+                "--delivery-deadline=3s",
+            ]
+            .iter()
+            .chain(extra)
+            .map(|s| (*s).to_owned()),
+        );
+        nodes.push(run_peer_with(&dir, &network.0, ip, args).await);
+    }
+    for c in &nodes {
+        wait_for("three-peer ring", Duration::from_secs(60), async || {
+            ring_size(c) == 3
+        })
+        .await;
+    }
+    for c in &nodes {
+        warm(c.traffic).await;
+    }
+    Cluster {
+        nodes,
+        ips,
+        origin,
+        _network: network,
+    }
+}
+
+/// Runs curl inside `from`, so the request leaves a discovered peer address; returns status and headers.
+fn curl_from(from: &Container, url: &str, headers: &[&str]) -> (u16, String) {
+    let mut args = vec![
+        "exec",
+        &from.id,
+        "curl",
+        "-s",
+        "-o",
+        "/dev/null",
+        "-D",
+        "-",
+        "-m",
+        "10",
+    ];
+    for h in headers {
+        args.extend(["-H", h]);
+    }
+    args.push(url);
+    let out = Command::new("docker").args(&args).output().unwrap();
+    let head = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, head)
+}
+
+async fn concurrent(addrs: &[SocketAddr], path: &str, per_node: usize) -> Vec<Reply> {
+    let mut tasks = Vec::new();
+    for _ in 0..per_node {
+        for addr in addrs {
+            let (addr, path) = (*addr, path.to_owned());
+            tasks.push(tokio::spawn(async move {
+                request(addr, "GET", &path, "").await
+            }));
+        }
+    }
+    let mut replies = Vec::new();
+    for task in tasks {
+        replies.push(task.await.unwrap());
+    }
+    replies
+}
+
+fn status_of(reply: &Reply) -> Vec<String> {
+    let doc: serde_json::Value = serde_json::from_str(&reply.body).unwrap_or_default();
+    doc["peers"]
+        .as_array()
+        .map(|peers| {
+            peers
+                .iter()
+                .map(|p| p["status"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn three_sharded_caches_fill_once_forward_one_hop_and_fall_back_to_origin() {
+    let cluster = start_cluster("shard", "10.213.78", &[]).await;
+    let nodes = &cluster.nodes;
+    let traffic: Vec<SocketAddr> = nodes.iter().map(|c| c.traffic).collect();
+    let origin = &cluster.origin;
+
+    for key in [
+        "/slow/a", "/slow/b", "/slow/c", "/slow/d", "/slow/e", "/slow/f",
+    ] {
+        let replies = concurrent(&traffic, key, 10).await;
+        assert!(replies.iter().all(|r| r.status == 200), "{key}");
+        assert!(
+            replies.iter().all(|r| r.body == replies[0].body),
+            "{key}: one representation"
+        );
+        assert_eq!(
+            hits(origin, key),
+            1,
+            "{key}: 30 concurrent cold requests through 3 caches fill once"
+        );
+        concurrent(&traffic, key, 2).await;
+        assert_eq!(hits(origin, key), 1, "{key}: warm requests never refill");
+        let leaked = replies
+            .iter()
+            .flat_map(|r| r.headers.keys())
+            .find(|k| k.starts_with("x-stalewise"));
+        assert_eq!(leaked, None, "internal headers never reach clients");
+    }
+
+    let raw = "?b=2&a=%2F&a=1&x=&%7E=~";
+    for i in 0..3 {
+        let path = format!("/echo/{i}{raw}");
+        for addr in &traffic {
+            assert_eq!(request(*addr, "GET", &path, "").await.status, 200);
+        }
+        let seen: Vec<_> = origin
+            .lock()
+            .unwrap()
+            .targets
+            .iter()
+            .filter(|(t, _)| t.starts_with(&format!("/echo/{i}?")))
+            .cloned()
+            .collect();
+        assert_eq!(seen.len(), 1, "one fill per object");
+        assert_eq!(
+            seen[0].0, path,
+            "the request target reaches the origin byte for byte"
+        );
+        assert_eq!(
+            seen[0].1.as_deref(),
+            Some("catalog.test"),
+            "the original authority is restored"
+        );
+    }
+
+    for addr in &traffic {
+        let spoofed = request(*addr, "GET", "/spoofed", "").await;
+        assert!(!spoofed.headers.keys().any(|k| k.starts_with("x-stalewise")));
+        let forged = request(
+            *addr,
+            "GET",
+            "/shard/forged",
+            "X-Stalewise-Shard-Hop: 1\r\nX-Stalewise-Host: other.test\r\n",
+        )
+        .await;
+        assert_eq!(
+            forged.status, 403,
+            "untrusted clients cannot send hop headers"
+        );
+    }
+    assert_eq!(hits(origin, "/shard/forged"), 0);
+
+    let host = "X-Stalewise-Host: catalog.test";
+    let hop = "X-Stalewise-Shard-Hop: 1";
+    let authority = format!("Host: {PEER_AUTHORITY}");
+    for ip in &cluster.ips {
+        let url = format!("http://{ip}:8080/hop/one");
+        let (status, head) = curl_from(&nodes[0], &url, &[&authority, hop, host]);
+        assert_eq!(status, 200, "{head}");
+        let ttl: u64 = head
+            .lines()
+            .find_map(|l| l.strip_prefix("x-stalewise-peer-ttl:"))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        assert!(
+            (1..=60).contains(&ttl),
+            "trusted forwards learn the owner's freshness: {head}"
+        );
+        assert!(head.contains("x-stalewise-peer-tags: ,"), "{head}");
+    }
+    assert_eq!(
+        hits(origin, "/hop/one"),
+        3,
+        "a forwarded request is served locally, never forwarded again"
+    );
+    let target = format!("http://{}:8080/hop/two", cluster.ips[1]);
+    for (bad, why) in [
+        (
+            vec![authority.as_str(), "X-Stalewise-Shard-Hop: 2", host],
+            "hop count",
+        ),
+        (vec![authority.as_str(), hop, hop, host], "duplicate hop"),
+        (vec![authority.as_str(), hop], "missing authority"),
+        (
+            vec![authority.as_str(), hop, "X-Stalewise-Host: a b"],
+            "malformed authority",
+        ),
+        (
+            vec![authority.as_str(), hop, host, host],
+            "duplicate authority",
+        ),
+    ] {
+        assert_eq!(curl_from(&nodes[0], &target, &bad).0, 400, "{why}");
+    }
+    assert_eq!(hits(origin, "/hop/two"), 0);
+
+    let auth = format!("Authorization: Bearer {TOKEN}\r\n");
+    let sync = request(
+        nodes[0].signaller,
+        "PURGE",
+        "/slow/a",
+        &format!("{auth}X-Stalewise-Wait: 10s\r\n"),
+    )
+    .await;
+    assert_eq!(sync.status, 200, "{}", sync.body);
+    assert_eq!(status_of(&sync), ["delivered"; 3]);
+    concurrent(&traffic, "/slow/a", 3).await;
+    assert_eq!(
+        hits(origin, "/slow/a"),
+        2,
+        "a broadcast purge refills exactly once"
+    );
+
+    let accepted = request(nodes[0].signaller, "PURGE", "/slow/b", &auth).await;
+    assert_eq!(accepted.status, 202);
+    assert_eq!(
+        accepted.headers.get("x-stalewise-pod").map(String::as_str),
+        Some("cache-0")
+    );
+    let location = accepted.headers["location"].clone();
+    let polled = request(
+        nodes[0].signaller,
+        "GET",
+        &format!("{location}?wait=10s"),
+        &auth,
+    )
+    .await;
+    assert_eq!(
+        (polled.status, status_of(&polled)),
+        (200, vec!["delivered".to_owned(); 3])
+    );
+    assert_eq!(
+        request(nodes[1].signaller, "GET", &location, &auth)
+            .await
+            .status,
+        404,
+        "status lives on the admitting pod"
+    );
+    assert_eq!(
+        request(nodes[0].signaller, "GET", &location, "")
+            .await
+            .status,
+        401
+    );
+
+    docker(&["stop", "-t", "1", &nodes[2].id]);
+    let keys: Vec<String> = (0..18).map(|i| format!("/fb/{i}")).collect();
+    for key in &keys {
+        for _ in 0..2 {
+            let reply = request(traffic[0], "GET", key, "").await;
+            assert_eq!(
+                reply.status, 200,
+                "{key} falls back to the origin when its owner is down"
+            );
+        }
+    }
+    let counts: Vec<usize> = keys.iter().map(|k| hits(origin, k)).collect();
+    assert!(counts.iter().all(|n| (1..=2).contains(n)), "{counts:?}");
+    let fallbacks = counts.iter().filter(|n| **n == 2).count();
+    assert!(
+        fallbacks > 0,
+        "keys owned by the stopped cache were fetched directly: {counts:?}"
+    );
+    let degraded = request(
+        nodes[0].signaller,
+        "PURGE",
+        "/fb/0",
+        &format!("{auth}X-Stalewise-Wait: 10s\r\n"),
+    )
+    .await;
+    assert_eq!(degraded.status, 504, "{}", degraded.body);
+    let states = status_of(&degraded);
+    assert_eq!(
+        states.iter().filter(|s| *s == "delivered").count(),
+        2,
+        "{states:?}"
+    );
+    assert!(
+        degraded.body.contains("\"reason\":\"deadline\""),
+        "{}",
+        degraded.body
+    );
+    eprintln!("fills: fallback keys {fallbacks}/18 counts {counts:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn sharded_local_copies_are_capped_and_purged_by_tag() {
+    let cluster = start_cluster("local", "10.213.79", &["--shard-local-ttl=2s"]).await;
+    let traffic: Vec<SocketAddr> = cluster.nodes.iter().map(|c| c.traffic).collect();
+    let origin = &cluster.origin;
+    for addr in &traffic {
+        assert_eq!(request(*addr, "GET", "/ltag/x", "").await.status, 200);
+    }
+    assert_eq!(hits(origin, "/ltag/x"), 1);
+    for addr in &traffic {
+        let reply = request(*addr, "GET", "/ltag/x", "").await;
+        assert!(reply.is_hit(), "every cache now answers from its own copy");
+        assert!(!reply.headers.contains_key("surrogate-key"));
+    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let mut local_hits = 0;
+    for addr in &traffic {
+        local_hits += usize::from(request(*addr, "GET", "/ltag/x", "").await.is_hit());
+    }
+    assert_eq!(
+        local_hits, 1,
+        "copies expire at the local cap while the owner stays fresh"
+    );
+    assert_eq!(hits(origin, "/ltag/x"), 1);
+    let auth = format!("Authorization: Bearer {TOKEN}\r\n");
+    let ban = request(
+        cluster.nodes[1].signaller,
+        "BAN",
+        "/",
+        &format!("{auth}X-Stalewise-Tag: gamma\r\nX-Stalewise-Wait: 10s\r\n"),
+    )
+    .await;
+    assert_eq!(ban.status, 200, "{}", ban.body);
+    for addr in &traffic {
+        let reply = request(*addr, "GET", "/ltag/x", "").await;
+        assert_eq!(reply.body, "/ltag/x #2", "the tag purge reached every copy");
+    }
+    assert_eq!(hits(origin, "/ltag/x"), 2, "one refill after the purge");
+}
+
+/// Fully rendered sharding VCL with a fixture entry that reports the owner a key maps to.
+fn ring_fixture(peers: &[(&str, &str)]) -> String {
+    use stalewise::endpoint::{Endpoint, Host};
+    use stalewise::membership::Peer;
+    use stalewise::render::{self, Context, RenderSettings, ShardSettings};
+    let settings = RenderSettings {
+        env: std::collections::BTreeMap::new(),
+        canonical_host: None,
+        backend_authority: "origin.test:8080".parse().unwrap(),
+        purge_acl: vec!["127.0.0.1".parse().unwrap()],
+        peer_purge: false,
+        probe_path: "/".into(),
+        uncacheable_ttl: Duration::from_secs(30),
+        max_object_size: 10_485_760,
+        shard: Some(ShardSettings {
+            pod_name: "fixture".into(),
+            peer_authority: PEER_AUTHORITY.parse().unwrap(),
+            local_ttl: Duration::ZERO,
+            peer_timeout: Duration::from_secs(1),
+        }),
+    };
+    let ring: Vec<Peer> = peers
+        .iter()
+        .map(|(pod, ip)| Peer {
+            pod_name: (*pod).into(),
+            namespace: "apps".into(),
+            address: ip.parse().unwrap(),
+            port: 8080,
+        })
+        .collect();
+    let origin = Endpoint::new(Host::Ip("127.0.0.1".parse().unwrap()), 9);
+    let ctx = Context::new(&settings, &ring, &[origin], &[]).unwrap();
+    let source = Template::embedded(Profile::Generic).source;
+    let vcl = String::from_utf8(render::render(&source, &ctx).unwrap()).unwrap();
+    vcl.replace("sub vcl_recv {", "sub stalewise_main_recv {")
+        + r#"
+sub vcl_recv {
+    if (req.http.X-Fixture-Int) {
+        set req.backend_hint = stalewise_owners.backend(by=KEY,
+            key=std.integer(req.http.X-Fixture-Int, 0),
+            healthy=IGNORE, warmup=0, rampup=false, resolve=NOW);
+        return (synth(200));
+    }
+    if (req.http.X-Fixture-Host) {
+        set req.http.Host = req.http.X-Fixture-Host;
+        set req.url = "/k/" + req.http.X-Fixture-Path;
+        call stalewise_shard_key;
+        call stalewise_shard_owner;
+        return (synth(200));
+    }
+    call stalewise_main_recv;
+}
+
+sub vcl_synth {
+    set resp.http.X-Owner = req.backend_hint;
+}
+"#
+}
+
+struct RingHost {
+    id: String,
+    addr: SocketAddr,
+    dir: PathBuf,
+    loaded: usize,
+}
+
+impl Drop for RingHost {
+    fn drop(&mut self) {
+        let _ = Command::new("docker").args(["rm", "-f", &self.id]).output();
+    }
+}
+
+impl RingHost {
+    async fn start(first: &str) -> Self {
+        build_image_once();
+        let dir = temp_dir("ring");
+        std::fs::write(dir.join("ring0.vcl"), first).unwrap();
+        let mount = format!("{}:/fx:ro", dir.display());
+        let id = docker(&[
+            "run",
+            "-d",
+            "--entrypoint",
+            "varnishd",
+            "-p",
+            "127.0.0.1::8080",
+            "-v",
+            &mount,
+            &image(),
+            "-F",
+            "-a",
+            ":8080",
+            "-f",
+            "/fx/ring0.vcl",
+            "-n",
+            "/tmp/varnish",
+            "-s",
+            "malloc,16m",
+        ]);
+        let addr = mapped(&id, "8080/tcp");
+        wait_for("fixture varnishd", Duration::from_secs(60), async || {
+            request(addr, "GET", "/", "X-Fixture-Int: 1\r\n")
+                .await
+                .status
+                == 200
+        })
+        .await;
+        Self {
+            id,
+            addr,
+            dir,
+            loaded: 0,
+        }
+    }
+
+    fn load(&mut self, vcl: &str) {
+        self.loaded += 1;
+        let name = format!("ring{}", self.loaded);
+        std::fs::write(self.dir.join(format!("{name}.vcl")), vcl).unwrap();
+        let path = format!("/fx/{name}.vcl");
+        docker(&[
+            "exec",
+            &self.id,
+            "varnishadm",
+            "-n",
+            "/tmp/varnish",
+            "vcl.load",
+            &name,
+            &path,
+        ]);
+        docker(&[
+            "exec",
+            &self.id,
+            "varnishadm",
+            "-n",
+            "/tmp/varnish",
+            "vcl.use",
+            &name,
+        ]);
+    }
+
+    async fn owner(&self, header: &str) -> String {
+        let reply = request(self.addr, "GET", "/", &format!("{header}\r\n")).await;
+        reply.headers.get("x-owner").cloned().unwrap_or_default()
+    }
+
+    /// The owning pod for a fixture header, mapped back from the backend name.
+    async fn owner_pod(&self, header: &str, peers: &[(&str, &str)]) -> String {
+        let backend = self.owner(header).await;
+        peers
+            .iter()
+            .find(|(_, ip)| {
+                let host = stalewise::endpoint::Host::Ip(ip.parse().unwrap());
+                backend == format!("peer_{}", stalewise::endpoint::vcl_identifier(&host, 8080))
+            })
+            .map_or(backend.clone(), |(pod, _)| (*pod).to_owned())
+    }
+
+    /// Owner pod for each of 240 paths under one authority.
+    async fn owners(&self, host: &str, peers: &[(&str, &str)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for i in 0..240 {
+            let header = format!("X-Fixture-Host: {host}\r\nX-Fixture-Path: {i}");
+            out.push(self.owner_pod(&header, peers).await);
+        }
+        out
+    }
+
+    /// Owner pods for the lowest and highest 32-bit ring keys.
+    async fn edges(&self, peers: &[(&str, &str)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for key in [0u32, 1, u32::MAX - 1, u32::MAX] {
+            out.push(
+                self.owner_pod(&format!("X-Fixture-Int: {key}"), peers)
+                    .await,
+            );
+        }
+        out
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn director_ring_is_deterministic_stable_and_moves_only_changed_ranges() {
+    let three = [
+        ("cache-0", "10.1.0.1"),
+        ("cache-1", "10.1.0.2"),
+        ("cache-2", "10.1.0.3"),
+    ];
+    let mut ring = RingHost::start(&ring_fixture(&three)).await;
+    let base = ring.owners("catalog.test", &three).await;
+    let pods: HashSet<&String> = base.iter().collect();
+    assert_eq!(
+        pods.len(),
+        3,
+        "every member owns part of the ring: {pods:?}"
+    );
+
+    ring.load(&ring_fixture(&three));
+    assert_eq!(
+        ring.owners("catalog.test", &three).await,
+        base,
+        "identical inputs give identical owners"
+    );
+    let other = ring.owners("other.test", &three).await;
+    assert_ne!(other, base, "the authority is part of the key");
+
+    // The director clamps instead of wrapping: keys past the last point stay on the last point.
+    let edges = ring.edges(&three).await;
+    assert_eq!(
+        edges[0], edges[1],
+        "the bottom edge belongs to the first point"
+    );
+    assert_eq!(edges[2], edges[3], "the top edge belongs to the last point");
+
+    let moved = [
+        ("cache-0", "10.9.0.1"),
+        ("cache-1", "10.9.0.2"),
+        ("cache-2", "10.9.0.3"),
+    ];
+    ring.load(&ring_fixture(&moved));
+    assert_eq!(
+        ring.owners("catalog.test", &moved).await,
+        base,
+        "address changes keep ownership"
+    );
+    assert_eq!(ring.edges(&moved).await, edges);
+
+    let four = [three[0], three[1], three[2], ("cache-3", "10.1.0.4")];
+    ring.load(&ring_fixture(&four));
+    let grown = ring.owners("catalog.test", &four).await;
+    let mut gained = 0;
+    for (before, after) in base.iter().zip(&grown) {
+        if before != after {
+            assert_eq!(after, "cache-3", "keys only move to the new member");
+            gained += 1;
+        }
+    }
+    assert!(gained > 0);
+    for (before, after) in edges.iter().zip(ring.edges(&four).await) {
+        assert!(
+            *before == after || after == "cache-3",
+            "edge keys move only to the new member"
+        );
+    }
+
+    let two = [three[0], three[2]];
+    ring.load(&ring_fixture(&two));
+    let shrunk = ring.owners("catalog.test", &two).await;
+    for (before, after) in base.iter().zip(&shrunk) {
+        if before != after {
+            assert_eq!(before, "cache-1", "only the removed member's keys move");
+        }
+    }
+    eprintln!("ring: {gained}/240 keys moved to the added member");
 }

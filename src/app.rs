@@ -16,7 +16,7 @@ use crate::endpoint::{Endpoint, Host};
 use crate::metrics::Metrics;
 use crate::mgmt::{self, ManagementConfig, StatusInputs};
 use crate::reload::{self, Active, BackendInput, Inputs, Policies, ReloadConfig};
-use crate::render::{self, OutputDir, RenderSettings, Template};
+use crate::render::{self, OutputDir, RenderSettings, ShardSettings, Template};
 use crate::signaller::{self, TokenDigest};
 use crate::status::{Health, Reason};
 use crate::varnish::admin::AdminConfig;
@@ -107,6 +107,12 @@ fn render_settings(config: &Config) -> RenderSettings {
         probe_path: config.backend_probe_path.clone(),
         uncacheable_ttl: config.uncacheable_ttl,
         max_object_size: config.max_object_size,
+        shard: config.shard.as_ref().map(|shard| ShardSettings {
+            pod_name: shard.pod_name.clone(),
+            peer_authority: shard.peer_authority.clone(),
+            local_ttl: shard.local_ttl,
+            peer_timeout: shard.peer_timeout,
+        }),
     }
 }
 
@@ -191,6 +197,7 @@ async fn api_inputs(
         let watch = discovery::watch(
             client,
             role,
+            config.membership_debounce,
             tx,
             Arc::clone(&shared.metrics),
             shared.health.clone(),

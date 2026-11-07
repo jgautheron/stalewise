@@ -1,6 +1,9 @@
 vcl 4.1;
 
 import std;
+{% if shard %}
+import directors;
+{% endif %}
 
 probe stalewise_origin_probe {
     .request =
@@ -28,6 +31,12 @@ sub vcl_init {
 sub stalewise_select_backend {
     set req.backend_hint = stalewise_origin;
 }
+{% if shard %}
+
+sub stalewise_origin_backend {
+    set bereq.backend = stalewise_origin;
+}
+{% endif %}
 
 # The sidecar routes on authority and answers 503 for any other value.
 sub stalewise_origin_host {

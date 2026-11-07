@@ -180,6 +180,21 @@ pub struct Cli {
     /// Host header for peer deliveries, e.g. the headless peers Service FQDN and port.
     #[arg(long, env = "STALEWISE_PEER_AUTHORITY")]
     pub peer_authority: Option<String>,
+    /// This pod's name; the shard identity and the pod reported on invalidation status.
+    #[arg(long, env = "STALEWISE_POD_NAME")]
+    pub pod_name: Option<String>,
+    /// Route each object to one owner pod through the VCL shard director.
+    #[arg(long, env = "STALEWISE_SHARD", num_args = 0..=1, default_missing_value = "true", default_value = "false", action = ArgAction::Set)]
+    pub shard: bool,
+    /// How long a frontend membership change must persist before it is rendered.
+    #[arg(long, env = "STALEWISE_MEMBERSHIP_DEBOUNCE", value_parser = parse_duration, default_value = "5s")]
+    pub membership_debounce: Duration,
+    /// Freshness cap for copies a non-owner keeps; zero stores no bodies off-owner.
+    #[arg(long, env = "STALEWISE_SHARD_LOCAL_TTL", value_parser = parse_duration, default_value = "0s")]
+    pub shard_local_ttl: Duration,
+    /// Invalidation status records the signaller retains.
+    #[arg(long, env = "STALEWISE_INVALIDATION_HISTORY", default_value_t = 1024)]
+    pub invalidation_history: usize,
     /// Every address of this pod; dual-stack pods list both families.
     #[arg(long, env = "STALEWISE_POD_IP", value_delimiter = ',', action = ArgAction::Append)]
     pub pod_ip: Vec<IpAddr>,
@@ -289,6 +304,9 @@ pub struct VarnishParam {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignalConfig {
     pub listen: SocketAddr,
+    /// Reported as `X-Stalewise-Pod` and the local target's pod.
+    pub pod_name: String,
+    pub history: usize,
     pub token_file: PathBuf,
     pub pod_ips: Vec<IpAddr>,
     pub local_frontend: SocketAddr,
@@ -305,6 +323,16 @@ pub struct SignalConfig {
     pub read_timeout: Duration,
     pub write_timeout: Duration,
     pub idle_timeout: Duration,
+}
+
+/// Consistent-hash routing across cache peers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardConfig {
+    pub pod_name: String,
+    /// Host header forwarded requests carry; the original authority travels separately.
+    pub peer_authority: Authority,
+    pub local_ttl: Duration,
+    pub peer_timeout: Duration,
 }
 
 /// Fully validated runtime configuration.
@@ -335,6 +363,8 @@ pub struct Config {
     pub shutdown_timeout: Duration,
     pub management_listen: SocketAddr,
     pub signaller: Option<SignalConfig>,
+    pub shard: Option<ShardConfig>,
+    pub membership_debounce: Duration,
     pub purge_acl: Vec<Cidr>,
     pub backend_probe_path: String,
     pub uncacheable_ttl: Duration,
@@ -515,6 +545,7 @@ impl Config {
         }
         let policies = policy_config(&cli, &backend, &namespace)?;
         let signaller = signal_config(&cli, canonical_host.clone())?;
+        let shard = shard_config(&cli)?;
         Ok(Self {
             profile: cli.profile,
             frontend,
@@ -540,6 +571,13 @@ impl Config {
             shutdown_timeout: positive("--shutdown-timeout", cli.shutdown_timeout)?,
             management_listen: cli.management_listen,
             signaller,
+            shard,
+            membership_debounce: within(
+                "--membership-debounce",
+                cli.membership_debounce,
+                MIN_DEBOUNCE,
+                MAX_DEBOUNCE,
+            )?,
             purge_acl: purge_acl(&cli.purge_acl)?,
             backend_probe_path: probe_path(&cli.backend_probe_path)?,
             uncacheable_ttl: positive("--uncacheable-ttl", cli.uncacheable_ttl)?,
@@ -711,6 +749,7 @@ fn signal_config(
     if cli.pod_ip.is_empty() {
         return Err(invalid("--pod-ip", "is required with --signaller"));
     }
+    let pod_name = pod_name(cli, "--signaller")?;
     let mut methods = cli.signaller_methods.clone();
     if methods.is_empty() {
         methods = vec![Method::Purge, Method::Ban];
@@ -723,6 +762,8 @@ fn signal_config(
     };
     Ok(Some(SignalConfig {
         listen: cli.signaller_listen,
+        pod_name,
+        history: at_least_one("--invalidation-history", cli.invalidation_history)?,
         token_file,
         pod_ips: cli.pod_ip.clone(),
         local_frontend: SocketAddr::new(local_ip, cli.listen.port()),
@@ -739,6 +780,64 @@ fn signal_config(
         write_timeout: positive("--write-timeout", cli.write_timeout)?,
         idle_timeout: positive("--idle-timeout", cli.idle_timeout)?,
     }))
+}
+
+const MIN_DEBOUNCE: Duration = Duration::from_millis(100);
+const MAX_DEBOUNCE: Duration = Duration::from_secs(30);
+const MAX_LOCAL_TTL: Duration = Duration::from_secs(30);
+
+fn shard_config(cli: &Cli) -> Result<Option<ShardConfig>, ConfigError> {
+    let local_ttl = within(
+        "--shard-local-ttl",
+        cli.shard_local_ttl,
+        Duration::ZERO,
+        MAX_LOCAL_TTL,
+    )?;
+    if !cli.shard {
+        return Ok(None);
+    }
+    if cli.pod_ip.is_empty() {
+        return Err(invalid("--pod-ip", "is required with --shard"));
+    }
+    let peer_authority = cli
+        .peer_authority
+        .as_deref()
+        .ok_or_else(|| invalid("--peer-authority", "is required with --shard"))?
+        .parse()?;
+    Ok(Some(ShardConfig {
+        pod_name: pod_name(cli, "--shard")?,
+        peer_authority,
+        local_ttl,
+        peer_timeout: positive("--peer-timeout", cli.peer_timeout)?,
+    }))
+}
+
+fn pod_name(cli: &Cli, needed_by: &str) -> Result<String, ConfigError> {
+    let name = cli
+        .pod_name
+        .as_deref()
+        .ok_or_else(|| invalid("--pod-name", format!("is required with {needed_by}")))?;
+    if crate::membership::valid_name(name) {
+        Ok(name.to_owned())
+    } else {
+        Err(invalid("--pod-name", format!("{name:?} is not a Pod name")))
+    }
+}
+
+fn within(
+    flag: &'static str,
+    value: Duration,
+    min: Duration,
+    max: Duration,
+) -> Result<Duration, ConfigError> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(invalid(
+            flag,
+            format!("must be between {min:?} and {max:?}"),
+        ))
+    }
 }
 
 fn peer_authority(raw: Option<&str>) -> Result<Option<HeaderValue>, ConfigError> {
@@ -1024,7 +1123,10 @@ mod tests {
         args.push("--signaller");
         assert!(parse(&args).is_err());
         args.extend(["--signaller-token-file=/t", "--pod-ip=10.0.0.7,fd00::7"]);
+        assert!(parse(&args).unwrap_err().to_string().contains("--pod-name"));
+        args.push("--pod-name=cache-0");
         let sig = parse(&args).unwrap().signaller.unwrap();
+        assert_eq!(sig.history, 1024);
         assert_eq!(sig.pod_ips.len(), 2, "dual-stack downward API value splits");
         assert_eq!(sig.methods, [Method::Purge, Method::Ban]);
         assert_eq!(sig.local_frontend, "127.0.0.1:8080".parse().unwrap());
@@ -1038,6 +1140,72 @@ mod tests {
         );
         args.push("--peer-authority=a b");
         assert!(parse(&args).is_err(), "peer authority is validated");
+    }
+
+    #[test]
+    fn shard_requires_identity_authority_and_addresses() {
+        let mut args = BASE.to_vec();
+        args.push("--shard");
+        for (missing, add) in [
+            ("--pod-ip", "--pod-ip=10.0.0.7"),
+            (
+                "--peer-authority",
+                "--peer-authority=cache-peers.apps.svc:8080",
+            ),
+            ("--pod-name", "--pod-name=cache-0"),
+        ] {
+            let err = parse(&args).unwrap_err().to_string();
+            assert!(err.contains(missing), "{err}");
+            args.push(add);
+        }
+        let cfg = parse(&args).unwrap();
+        let shard = cfg.shard.unwrap();
+        assert_eq!(shard.pod_name, "cache-0");
+        assert_eq!(shard.local_ttl, Duration::ZERO);
+        assert_eq!(shard.peer_timeout, Duration::from_secs(2));
+        assert_eq!(cfg.membership_debounce, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn membership_debounce_and_local_ttl_are_bounded() {
+        for (flag, ok) in [
+            ("--membership-debounce=100ms", true),
+            ("--membership-debounce=30s", true),
+            ("--membership-debounce=99ms", false),
+            ("--membership-debounce=31s", false),
+            ("--shard-local-ttl=30s", true),
+            ("--shard-local-ttl=31s", false),
+            ("--pod-name=Cache_0", true),
+        ] {
+            let mut args = BASE.to_vec();
+            args.push(flag);
+            assert_eq!(parse(&args).is_ok(), ok, "{flag}");
+        }
+        let mut args = BASE.to_vec();
+        args.extend([
+            "--shard",
+            "--pod-ip=10.0.0.7",
+            "--peer-authority=p.apps:8080",
+            "--pod-name=Cache_0",
+        ]);
+        assert!(
+            parse(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("not a Pod name")
+        );
+    }
+
+    #[test]
+    fn config_file_carries_the_v0_3_keys() {
+        let file = format!(
+            "{FILE}shard: true\npodName: cache-0\npodIp: [10.0.0.7]\npeerAuthority: p.apps:8080\nmembershipDebounce: 2s\nshardLocalTtl: 5s\ninvalidationHistory: 64\n"
+        );
+        let cli = layered(&file, &[]).unwrap();
+        assert_eq!(cli.invalidation_history, 64);
+        let cfg = Config::from_cli(cli, |_| None).unwrap();
+        assert_eq!(cfg.membership_debounce, Duration::from_secs(2));
+        assert_eq!(cfg.shard.unwrap().local_ttl, Duration::from_secs(5));
     }
 
     #[test]

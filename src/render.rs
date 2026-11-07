@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Profile;
 use crate::endpoint::{Authority, Cidr, Endpoint, Host};
+use crate::membership::Peer;
 use crate::policy::RenderPolicy;
 
 /// Template input and rendered output limit.
@@ -39,6 +40,8 @@ pub enum RenderError {
     Template(String),
     #[error("ambiguous VCL identifier {0}")]
     Collision(String),
+    #[error("template does not implement --shard (no X-Stalewise-Shard-Hop handling)")]
+    ShardUnsupported,
     #[error("unsafe output path {path}: {reason}")]
     UnsafePath { path: PathBuf, reason: &'static str },
     #[error("publish I/O: {0}")]
@@ -109,6 +112,44 @@ pub struct RenderSettings {
     pub probe_path: String,
     pub uncacheable_ttl: Duration,
     pub max_object_size: u64,
+    pub shard: Option<ShardSettings>,
+}
+
+/// Sharding inputs that do not change with membership.
+#[derive(Debug, Clone)]
+pub struct ShardSettings {
+    pub pod_name: String,
+    pub peer_authority: Authority,
+    pub local_ttl: Duration,
+    pub peer_timeout: Duration,
+}
+
+/// Header every sharding template must handle; its absence means the template ignores `--shard`.
+pub const SHARD_HOP_HEADER: &str = "X-Stalewise-Shard-Hop";
+/// Virtual ring points per peer; every replica renders the same value.
+pub const SHARD_REPLICAS: u32 = 67;
+
+/// One ring member; `ident` is stable across address changes.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShardPeer {
+    pub name: String,
+    pub host: Host,
+    pub port: u16,
+    pub ident: String,
+}
+
+/// Present whenever sharding is enabled; an empty ring routes every request to the origin.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShardContext {
+    pub peers: Vec<ShardPeer>,
+    /// The ring member that is this pod, compared by backend equality in VCL.
+    pub self_backend: Option<String>,
+    pub replicas: u32,
+    /// Discovered peers plus the configured purge ACL; only they may send hop headers.
+    pub trusted: Vec<Cidr>,
+    pub peer_authority: Authority,
+    pub peer_timeout_ms: u128,
+    pub local_ttl_seconds: u64,
 }
 
 /// The documented template context; field names are the template contract.
@@ -127,32 +168,71 @@ pub struct Context {
     pub max_object_size: u64,
     /// Accepted CachePolicies, most specific first; `id` is each one's VCL tag.
     pub policies: Vec<RenderPolicy>,
+    pub shard: Option<ShardContext>,
 }
 
 impl Context {
-    /// Builds a context from sorted endpoint lists; rejects identifier collisions.
+    /// Builds a context from ordered peers and sorted origins; rejects identifier collisions.
     pub fn new(
         settings: &RenderSettings,
-        frontends: &[Endpoint],
+        peers: &[Peer],
         backends: &[Endpoint],
         policies: &[RenderPolicy],
     ) -> Result<Self, RenderError> {
-        check_unique(frontends)?;
+        let frontends: Vec<Endpoint> = peers.iter().map(Peer::endpoint).collect();
+        check_unique(&frontends)?;
         check_unique(backends)?;
+        let shard = settings
+            .shard
+            .as_ref()
+            .map(|shard| shard_context(settings, shard, peers));
         Ok(Self {
-            frontends: frontends.to_vec(),
-            backends: backends.to_vec(),
+            purge_acl: purge_acl(settings, &frontends),
             primary_frontend: frontends.first().cloned(),
+            frontends,
+            backends: backends.to_vec(),
             primary_backend: backends.first().cloned(),
             env: settings.env.clone(),
             canonical_host: settings.canonical_host.clone(),
             backend_authority: settings.backend_authority.clone(),
-            purge_acl: purge_acl(settings, frontends),
             probe_path: settings.probe_path.clone(),
             uncacheable_ttl_seconds: settings.uncacheable_ttl.as_secs().max(1),
             max_object_size: settings.max_object_size,
             policies: policies.to_vec(),
+            shard,
         })
+    }
+}
+
+fn shard_context(settings: &RenderSettings, shard: &ShardSettings, peers: &[Peer]) -> ShardContext {
+    let ring: Vec<ShardPeer> = peers
+        .iter()
+        .map(|p| ShardPeer {
+            name: format!("peer_{}", p.endpoint().name),
+            host: Host::Ip(p.address),
+            port: p.port,
+            ident: p.ident(),
+        })
+        .collect();
+    let self_backend = peers
+        .iter()
+        .zip(&ring)
+        .find(|(p, _)| p.pod_name == shard.pod_name)
+        .map(|(_, r)| r.name.clone());
+    let mut trusted: Vec<Cidr> = peers.iter().map(|p| Cidr::host(p.address)).collect();
+    for net in &settings.purge_acl {
+        if !trusted.contains(net) {
+            trusted.push(*net);
+        }
+    }
+    ShardContext {
+        peers: ring,
+        self_backend,
+        replicas: SHARD_REPLICAS,
+        trusted,
+        peer_authority: shard.peer_authority.clone(),
+        peer_timeout_ms: shard.peer_timeout.as_millis(),
+        local_ttl_seconds: shard.local_ttl.as_secs(),
     }
 }
 
@@ -217,6 +297,9 @@ pub fn render(template: &str, context: &Context) -> Result<Vec<u8>, RenderError>
     }
     if output.contains('\0') {
         return Err(RenderError::Encoding);
+    }
+    if context.shard.is_some() && !output.contains(SHARD_HOP_HEADER) {
+        return Err(RenderError::ShardUnsupported);
     }
     Ok(output.into_bytes())
 }
@@ -414,11 +497,112 @@ mod tests {
             probe_path: "/healthz".into(),
             uncacheable_ttl: Duration::from_secs(30),
             max_object_size: 10_485_760,
+            shard: None,
         }
     }
 
     fn ip(addr: &str, port: u16) -> Endpoint {
         Endpoint::new(Host::Ip(addr.parse().unwrap()), port)
+    }
+
+    fn peer(name: &str, addr: &str) -> Peer {
+        Peer {
+            pod_name: name.into(),
+            namespace: "apps".into(),
+            address: addr.parse().unwrap(),
+            port: 8080,
+        }
+    }
+
+    fn sharded(local_ttl: u64) -> RenderSettings {
+        RenderSettings {
+            shard: Some(ShardSettings {
+                pod_name: "cache-1".into(),
+                peer_authority: "cache-peers.apps.svc.cluster.local:8080".parse().unwrap(),
+                local_ttl: Duration::from_secs(local_ttl),
+                peer_timeout: Duration::from_millis(1500),
+            }),
+            ..settings()
+        }
+    }
+
+    fn render_generic(s: &RenderSettings, peers: &[Peer]) -> String {
+        let ctx = Context::new(s, peers, &[ip("10.0.0.7", 8080)], &[]).unwrap();
+        String::from_utf8(render(&Template::embedded(Profile::Generic).source, &ctx).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn shard_ring_uses_stable_identities_and_checks_every_initialisation() {
+        let peers = [peer("cache-0", "10.1.0.1"), peer("cache-1", "10.1.0.2")];
+        let out = render_generic(&sharded(0), &peers);
+        for fragment in [
+            "new stalewise_owners = directors.shard();",
+            "if (!stalewise_owners.add_backend(peer_ip_10_1_0_1_8080_v4, ident=\"apps/cache-0\")) {",
+            "if (!stalewise_owners.reconfigure(67)) {",
+            ".first_byte_timeout = 1500ms;",
+            "if (req.backend_hint == peer_ip_10_1_0_2_8080_v4) {",
+            "set bereq.http.Host = \"cache-peers.apps.svc.cluster.local:8080\";",
+            "healthy=IGNORE, warmup=0, rampup=false, resolve=NOW);",
+            "\"10.1.0.1\"/32;",
+        ] {
+            assert!(out.contains(fragment), "missing {fragment}");
+        }
+        assert_eq!(out.matches("return (fail);").count(), 3);
+        assert!(
+            out.contains("return (pass);\n        }\n    }\n}"),
+            "non-owners store no bodies by default"
+        );
+        assert!(!out.contains("sub stalewise_local_copy"));
+        let moved = [peer("cache-0", "10.9.9.9"), peer("cache-1", "10.1.0.2")];
+        assert!(render_generic(&sharded(0), &moved).contains("ident=\"apps/cache-0\""));
+    }
+
+    #[test]
+    fn shard_local_copies_render_only_when_enabled() {
+        let out = render_generic(&sharded(10), &[peer("cache-0", "10.1.0.1")]);
+        assert!(out.contains("sub stalewise_local_copy"));
+        assert!(out.contains("set beresp.ttl = 10s;"));
+        assert!(out.contains("call stalewise_fallback_cap;"));
+        assert!(
+            !out.contains("req.backend_hint == peer_"),
+            "this pod is not a member yet"
+        );
+    }
+
+    #[test]
+    fn empty_membership_fetches_directly_but_still_honours_hop_headers() {
+        let out = render_generic(&sharded(0), &[]);
+        assert!(!out.contains("directors.shard()"));
+        assert!(!out.contains("call stalewise_shard_route;"));
+        assert!(out.contains("call stalewise_peer_request;"));
+        let off = render_generic(&settings(), &[peer("cache-0", "10.1.0.1")]);
+        assert!(!off.contains("stalewise_peers"));
+        assert!(off.contains("unset req.http.X-Stalewise-Shard-Hop;"));
+    }
+
+    #[test]
+    fn mesh_template_supports_sharding() {
+        let dns = Endpoint::new(
+            Host::Dns("catalog.apps.svc.cluster.local".parse().unwrap()),
+            8080,
+        );
+        let ctx = Context::new(&sharded(0), &[peer("cache-0", "10.1.0.1")], &[dns], &[]).unwrap();
+        let out =
+            String::from_utf8(render(&Template::embedded(Profile::Mesh).source, &ctx).unwrap())
+                .unwrap();
+        assert!(out.contains("import directors;"));
+        assert!(out.contains("set bereq.backend = stalewise_origin;"));
+    }
+
+    #[test]
+    fn custom_templates_without_the_hop_contract_reject_sharding() {
+        let ctx = Context::new(&sharded(0), &[], &[ip("10.0.0.7", 8080)], &[]).unwrap();
+        assert!(matches!(
+            render("vcl 4.1;", &ctx),
+            Err(RenderError::ShardUnsupported)
+        ));
+        assert!(render("vcl 4.1; # X-Stalewise-Shard-Hop", &ctx).is_ok());
     }
 
     #[test]
@@ -447,7 +631,7 @@ mod tests {
         let mut with = settings();
         with.purge_acl = vec!["127.0.0.1".parse().unwrap()];
         with.peer_purge = true;
-        let peers = [ip("10.1.2.3", 8080), ip("fd00::9", 8080)];
+        let peers = [peer("a", "10.1.2.3"), peer("b", "fd00::9")];
         let render_acl = |s: &RenderSettings| {
             let ctx = Context::new(s, &peers, &[ip("10.0.0.7", 8080)], &[]).unwrap();
             String::from_utf8(render(&Template::embedded(Profile::Generic).source, &ctx).unwrap())

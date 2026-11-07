@@ -90,6 +90,17 @@ fn route(path: &str, n: usize) -> (StatusCode, Vec<(&'static str, String)>, Stri
         ),
         "/nofresh" => (StatusCode::OK, vec![], body),
         "/flaky" => (StatusCode::OK, cc("max-age=1, stale-if-error=120"), body),
+        "/aged" => (
+            StatusCode::OK,
+            vec![
+                (
+                    "cache-control",
+                    "max-age=60, stale-while-revalidate=300".into(),
+                ),
+                ("age", "600".into()),
+            ],
+            body,
+        ),
         "/events" => (
             StatusCode::OK,
             vec![
@@ -537,3 +548,16 @@ async fn origin_5xx_then_sick_keeps_serving_stale_if_error() {
     assert_eq!((stale.status, stale.body.as_str()), (200, "/flaky #1"));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn age_beyond_max_age_never_restarts_stale_while_revalidate() {
+    let (port, origin) = start_origin().await;
+    let dir = temp_dir("aged");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let c = run_cache(&dir, &base_args(port)).await;
+    warm(c.traffic).await;
+    request(c.traffic, "GET", "/aged", "").await;
+    let again = request(c.traffic, "GET", "/aged", "").await;
+    assert!(!again.is_hit(), "allowance already spent upstream");
+    assert_eq!(hits(&origin, "/aged"), 2);
+}

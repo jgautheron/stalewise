@@ -217,13 +217,11 @@ sub stalewise_freshness {
         set beresp.http.X-Stalewise-Fresh = regsub(beresp.http.X-Stalewise-Control,
             "(?i)^.*(?:^|,)\s*max-age\s*=\s*([0-9]+)\s*(?:,.*)?$", "\1");
     }
-    if (beresp.http.Surrogate-Control) {
-        if (beresp.http.X-Stalewise-Fresh == "") {
-            call stalewise_uncacheable;
-        }
+    if (beresp.http.X-Stalewise-Fresh != "") {
+        # Remaining freshness from the chosen directive; an Age overrun goes negative and shrinks grace.
         set beresp.ttl = std.duration(beresp.http.X-Stalewise-Fresh + "s", 0s) -
             std.duration(beresp.http.Age + "s", 0s);
-    } elsif (beresp.http.X-Stalewise-Fresh == "" && !beresp.http.Expires) {
+    } elsif (beresp.http.Surrogate-Control || !beresp.http.Expires) {
         call stalewise_uncacheable;
     }
 }

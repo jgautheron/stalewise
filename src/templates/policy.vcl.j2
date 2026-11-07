@@ -16,7 +16,6 @@ sub stalewise_clear_request {
     unset req.http.X-Stalewise-Control;
     unset req.http.X-Stalewise-Fresh;
     unset req.http.X-Stalewise-Tags;
-    unset req.http.X-Stalewise-Host;
     unset req.http.X-Stalewise-Refetch;
     unset req.http.X-Stalewise-Stale;
 }
@@ -38,6 +37,12 @@ sub vcl_recv {
         set req.http.Host = std.tolower(req.http.Host);
     }
 {% endif %}
+    # Peers dial with the peers Service as Host; the purge key host travels separately.
+    if (req.http.X-Stalewise-Host && (req.method == "PURGE" || req.method == "BAN") &&
+        client.ip ~ stalewise_purgers) {
+        set req.http.Host = std.tolower(req.http.X-Stalewise-Host);
+    }
+    unset req.http.X-Stalewise-Host;
     if (req.http.Host && req.http.Host !~ "^([a-z0-9_.-]+|\[[0-9a-f:.]+\])(:[0-9]{1,5})?$") {
         return (synth(400, "Bad Request"));
     }

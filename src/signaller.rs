@@ -26,6 +26,7 @@ use crate::metrics::{DeliveryResult, Metrics, ResultLabels, StatusClass, StatusL
 const TOKEN_MIN: usize = 32;
 const TOKEN_MAX: usize = 256;
 const TAG_HEADER: &str = "x-stalewise-tag";
+const HOST_HEADER: &str = "x-stalewise-host";
 const MAX_TAG: usize = 128;
 const RETRY_BASE_MS: u64 = 100;
 const RETRY_CAP_MS: u64 = 1000;
@@ -94,7 +95,7 @@ pub fn load_token(path: &Path) -> Result<TokenDigest, SignallerError> {
 pub struct Invalidation {
     method: HttpMethod,
     path: String,
-    host: String,
+    host: HeaderValue,
     headers: HeaderMap,
     body: Bytes,
 }
@@ -103,6 +104,8 @@ pub struct Invalidation {
 pub struct Delivery {
     pub request: Arc<Invalidation>,
     pub peer: SocketAddr,
+    /// Host header sent on the wire; the invalidation host travels in `X-Stalewise-Host`.
+    pub authority: HeaderValue,
     pub deadline: Instant,
 }
 
@@ -262,19 +265,38 @@ fn origin_form(uri: &hyper::Uri) -> Result<String, Rejection> {
     }
 }
 
-fn target_host(canonical: Option<&Authority>, headers: &HeaderMap) -> Result<String, Rejection> {
-    if let Some(canonical) = canonical {
-        return Ok(canonical.to_string());
-    }
+fn target_host(
+    canonical: Option<&Authority>,
+    headers: &HeaderMap,
+) -> Result<HeaderValue, Rejection> {
     let bad = Rejection::BadRequest("valid Host required\n");
+    if let Some(canonical) = canonical {
+        return authority_value(canonical).ok_or(bad);
+    }
     let mut values = headers.get_all(header::HOST).iter();
     let (Some(value), None) = (values.next(), values.next()) else {
         return Err(bad);
     };
     let text = value.to_str().map_err(|_| bad)?;
-    text.parse::<Authority>()
-        .map(|a| a.to_string())
-        .map_err(|_| bad)
+    let authority = text.parse::<Authority>().map_err(|_| bad)?;
+    authority_value(&authority).ok_or(bad)
+}
+
+fn authority_value(authority: &Authority) -> Option<HeaderValue> {
+    HeaderValue::from_str(&authority.to_string()).ok()
+}
+
+/// Host header for one target: peers get `--peer-authority` when set, so a mesh sidecar
+/// routes by the peers Service instead of the application's routes.
+pub fn wire_authority(
+    config: &SignalConfig,
+    peer: SocketAddr,
+    invalidation_host: &HeaderValue,
+) -> HeaderValue {
+    match &config.peer_authority {
+        Some(authority) if peer != config.local_frontend => authority.clone(),
+        _ => invalidation_host.clone(),
+    }
 }
 
 fn single_tag(headers: &HeaderMap) -> Result<(), Rejection> {
@@ -376,6 +398,7 @@ fn enqueue(
     let deadline = Instant::now() + intake.config.delivery_deadline;
     for (permit, peer) in permits.zip(peers) {
         permit.send(Delivery {
+            authority: wire_authority(&intake.config, *peer, &request.host),
             request: Arc::clone(&request),
             peer: *peer,
             deadline,
@@ -451,7 +474,7 @@ async fn deliver(delivery: Delivery, peer_timeout: Duration, metrics: &Metrics) 
         }
         let result = http::send(
             delivery.peer,
-            build(&delivery.request),
+            build(&delivery.request, &delivery.authority),
             peer_timeout.min(remaining),
         )
         .await;
@@ -472,15 +495,14 @@ async fn deliver(delivery: Delivery, peer_timeout: Duration, metrics: &Metrics) 
     }
 }
 
-fn build(inv: &Invalidation) -> Request<Body> {
+fn build(inv: &Invalidation, authority: &HeaderValue) -> Request<Body> {
     let mut request = Request::new(Full::new(inv.body.clone()));
     *request.method_mut() = inv.method.clone();
     *request.uri_mut() = inv.path.parse().unwrap_or_default();
     let headers = request.headers_mut();
     headers.clone_from(&inv.headers);
-    if let Ok(host) = HeaderValue::from_str(&inv.host) {
-        headers.insert(header::HOST, host);
-    }
+    headers.insert(header::HOST, authority.clone());
+    headers.insert(HeaderName::from_static(HOST_HEADER), inv.host.clone());
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(inv.body.len()));
     headers.insert(
         HeaderName::from_static("connection"),
@@ -549,6 +571,7 @@ mod tests {
             pod_ips: vec!["10.9.9.9".parse().unwrap(), "fd00::9".parse().unwrap()],
             local_frontend: local,
             canonical_host: Some("catalog.apps.svc".parse().unwrap()),
+            peer_authority: None,
             methods: vec![Method::Purge, Method::Ban],
             body_limit: 64,
             workers: 4,
@@ -681,6 +704,39 @@ mod tests {
         assert!(matches!(v6.ip(), IpAddr::V6(_)));
     }
 
+    #[test]
+    fn peers_get_the_peer_authority_and_local_delivery_keeps_the_invalidation_host() {
+        let local: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer: SocketAddr = "10.1.2.3:8080".parse().unwrap();
+        let host = HeaderValue::from_static("catalog.apps.svc");
+        let mut cfg = config(local, 8, Duration::from_secs(1));
+        assert_eq!(
+            wire_authority(&cfg, peer, &host),
+            host,
+            "unset keeps today's Host"
+        );
+        cfg.peer_authority = Some(HeaderValue::from_static("cache-peers.ns.svc:8080"));
+        assert_eq!(wire_authority(&cfg, peer, &host), "cache-peers.ns.svc:8080");
+        assert_eq!(wire_authority(&cfg, local, &host), host);
+    }
+
+    #[test]
+    fn built_request_carries_wire_host_and_invalidation_host_separately() {
+        let mut spoofed = HeaderMap::new();
+        spoofed.insert(HOST_HEADER, HeaderValue::from_static("evil.test"));
+        let inv = Invalidation {
+            method: HttpMethod::from_bytes(b"PURGE").unwrap(),
+            path: "/a".into(),
+            host: HeaderValue::from_static("catalog.apps.svc"),
+            headers: spoofed,
+            body: Bytes::new(),
+        };
+        let req = build(&inv, &HeaderValue::from_static("cache-peers.ns.svc:8080"));
+        assert_eq!(req.headers()["host"], "cache-peers.ns.svc:8080");
+        let carried: Vec<_> = req.headers().get_all(HOST_HEADER).iter().collect();
+        assert_eq!(carried, ["catalog.apps.svc"], "client value is replaced");
+    }
+
     #[tokio::test]
     async fn rejects_bad_auth_methods_bodies_and_tags_without_queueing() {
         let (local, seen) = peer("127.0.0.1:0", vec![200]).await;
@@ -739,6 +795,7 @@ mod tests {
         assert_eq!(got.path, "/a?b=1");
         assert_eq!(got.body, Bytes::from_static(b"hi"));
         assert_eq!(got.headers["host"], "catalog.apps.svc");
+        assert_eq!(got.headers["x-stalewise-host"], "catalog.apps.svc");
         assert!(got.headers.get("authorization").is_none());
         assert!(got.headers.get("x-hop").is_none());
         assert_eq!(got.headers["x-keep"], "1");

@@ -73,8 +73,12 @@ On a dual-stack pod, pass every pod address to `--pod-ip` as a comma-separated l
 Callers send `PURGE` for one URL, or `BAN` with exactly one `X-Stalewise-Tag` header, to port 8081 with `Authorization: Bearer <token>`.
 A `202 Accepted` response means the request is queued in memory, not that every peer purged it.
 
+Call the signaller Service by its own name and do not override `Host`.
+Behind a mesh, a `Host` set to the application host makes the caller's sidecar route the request to the application, not to the signaller.
+Set `--canonical-host` so that stalewise applies the application host on the server side.
+
 ```sh
-curl -X PURGE -H "Authorization: Bearer $TOKEN" -H 'Host: catalog.apps.svc.cluster.local' \
+curl -X PURGE -H "Authorization: Bearer $TOKEN" \
   http://catalog-cache.apps.svc.cluster.local:8081/products/42
 curl -X BAN -H "Authorization: Bearer $TOKEN" -H 'X-Stalewise-Tag: product-42' \
   http://catalog-cache.apps.svc.cluster.local:8081/
@@ -86,6 +90,11 @@ With `--signaller`, each discovered peer pod address is added to the ACL as a si
 With an Istio-style sidecar, inbound traffic arrives from `127.0.0.6`.
 That address admits every caller the sidecar forwards, so trust it only together with a mesh `AuthorizationPolicy` that restricts invalidation methods.
 The Helm chart adds `127.0.0.6/32` only when it renders that `AuthorizationPolicy`.
+
+Peer deliveries dial each peer pod address and send `--peer-authority` as `Host` when it is set.
+The chart sets it to the headless peers Service, for example `catalog-cache-stalewise-peers.apps.svc.cluster.local:8080`.
+Every delivery carries the invalidation host in `X-Stalewise-Host`.
+Varnish uses that header as the purge or ban key host only when the client is in the purge ACL, and it removes the header from every other request.
 
 ## Helm chart
 

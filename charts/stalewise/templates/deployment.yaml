@@ -136,6 +136,8 @@ spec:
               value: {{ join "," .Values.signaller.methods | quote }}
             - name: STALEWISE_DELIVERY_DEADLINE
               value: {{ .Values.signaller.deliveryDeadline | quote }}
+            - name: STALEWISE_PEER_AUTHORITY
+              value: {{ .Values.signaller.peerAuthority | default (printf "%s-peers.%s.svc.cluster.local:%v" $fullname .Release.Namespace .Values.ports.http) | quote }}
             {{- end }}
           ports:
             - name: http

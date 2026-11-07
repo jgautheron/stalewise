@@ -51,6 +51,8 @@ signaller:
     key: token
   methods: [PURGE, BAN]
   deliveryDeadline: 10s
+  # Host header for peer deliveries; empty means the headless peers Service FQDN and port.
+  peerAuthority: ""
 
 # Extra purge ACL entries beyond loopback and the signaller defaults.
 purgeAcl: []

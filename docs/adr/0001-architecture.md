@@ -72,6 +72,8 @@ A dispatcher owns the queue receiver and at most N delivery tasks. Admission res
 
 With the signaller enabled, the reloader renders each discovered peer pod address into the purge ACL as a `/32` or `/128` entry; operators never list cluster pod CIDRs. We chose this over forwarding to peer signaller ports because it reuses the existing reload path and needs no second authenticated hop or loop guard. The sidecar address `127.0.0.6` is trusted only when the chart also enforces the AuthorizationPolicy.
 
+Peer deliveries send `--peer-authority` (the headless peers Service) as Host and carry the invalidation host in `X-Stalewise-Host`, which VCL honours only from purge-ACL clients. A sidecar routes outbound traffic by Host: the application host would reach the origin, and a bare pod IP would leave in plaintext, while the headless Service's original-destination route reaches the dialled pod over mTLS.
+
 ### Observability
 
 Use `stalewise_` metrics with bounded role/reason/status-class/result labels:

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{ArgAction, Parser, ValueEnum};
+use hyper::header::HeaderValue;
 
 use crate::endpoint::{AddressError, Authority, Cidr, DnsName, Host};
 
@@ -150,6 +151,9 @@ pub struct Cli {
     pub signaller_listen: SocketAddr,
     #[arg(long, env = "STALEWISE_SIGNALLER_TOKEN_FILE")]
     pub signaller_token_file: Option<PathBuf>,
+    /// Host header for peer deliveries, e.g. the headless peers Service FQDN and port.
+    #[arg(long, env = "STALEWISE_PEER_AUTHORITY")]
+    pub peer_authority: Option<String>,
     /// Every address of this pod; dual-stack pods list both families.
     #[arg(long, env = "STALEWISE_POD_IP", value_delimiter = ',', action = ArgAction::Append)]
     pub pod_ip: Vec<IpAddr>,
@@ -238,6 +242,8 @@ pub struct SignalConfig {
     pub pod_ips: Vec<IpAddr>,
     pub local_frontend: SocketAddr,
     pub canonical_host: Option<Authority>,
+    /// Host header for peer deliveries; `None` sends the invalidation host.
+    pub peer_authority: Option<HeaderValue>,
     pub methods: Vec<Method>,
     pub body_limit: usize,
     pub workers: usize,
@@ -463,6 +469,7 @@ fn signal_config(
         pod_ips: cli.pod_ip.clone(),
         local_frontend: SocketAddr::new(local_ip, cli.listen.port()),
         canonical_host,
+        peer_authority: peer_authority(cli.peer_authority.as_deref())?,
         methods,
         body_limit: at_least_one("--signaller-body-limit", cli.signaller_body_limit)?,
         workers: at_least_one("--signaller-workers", cli.signaller_workers)?,
@@ -474,6 +481,16 @@ fn signal_config(
         write_timeout: positive("--write-timeout", cli.write_timeout)?,
         idle_timeout: positive("--idle-timeout", cli.idle_timeout)?,
     }))
+}
+
+fn peer_authority(raw: Option<&str>) -> Result<Option<HeaderValue>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let authority: Authority = raw.parse()?;
+    HeaderValue::from_str(&authority.to_string())
+        .map(Some)
+        .map_err(|_| invalid("--peer-authority", "is not a valid Host header"))
 }
 
 fn kube_name(flag: &'static str, raw: &str) -> Result<String, ConfigError> {
@@ -754,6 +771,15 @@ mod tests {
         assert_eq!(sig.methods, [Method::Purge, Method::Ban]);
         assert_eq!(sig.local_frontend, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(sig.workers, 4);
+        assert_eq!(sig.peer_authority, None);
+        args.push("--peer-authority=cache-peers.ns.svc.cluster.local:8080");
+        let sig = parse(&args).unwrap().signaller.unwrap();
+        assert_eq!(
+            sig.peer_authority.unwrap(),
+            "cache-peers.ns.svc.cluster.local:8080"
+        );
+        args.push("--peer-authority=a b");
+        assert!(parse(&args).is_err(), "peer authority is validated");
     }
 
     #[test]

@@ -255,6 +255,10 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 async fn run_cache(config_dir: &Path, args: &[String]) -> Container {
+    run_cache_with(config_dir, &[], args).await
+}
+
+async fn run_cache_with(config_dir: &Path, docker_extra: &[String], args: &[String]) -> Container {
     build_image_once();
     let mount = format!("{}:/config:ro", config_dir.display());
     let mut argv: Vec<String> = [
@@ -281,6 +285,7 @@ async fn run_cache(config_dir: &Path, args: &[String]) -> Container {
     .iter()
     .map(|s| (*s).to_owned())
     .collect();
+    argv.extend_from_slice(docker_extra);
     argv.push(image());
     argv.extend_from_slice(args);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -560,4 +565,152 @@ async fn age_beyond_max_age_never_restarts_stale_while_revalidate() {
     let again = request(c.traffic, "GET", "/aged", "").await;
     assert!(!again.is_hit(), "allowance already spent upstream");
     assert_eq!(hits(&origin, "/aged"), 2);
+}
+
+const PEER_SUBNET: &str = "10.213.77.0/24";
+const PEER_A: &str = "10.213.77.10";
+const PEER_B: &str = "10.213.77.11";
+const PEER_AUTHORITY: &str = "cache-peers.default.svc.cluster.local:8080";
+
+struct Network(String);
+
+impl Drop for Network {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["network", "rm", &self.0])
+            .output();
+    }
+}
+
+/// Minimal Kubernetes API: one EndpointSlice listing both peers; watches idle, then end.
+async fn start_fake_kube(peers: &[&str]) -> u16 {
+    let addresses: Vec<String> = peers
+        .iter()
+        .map(|ip| format!(r#"{{"addresses":["{ip}"],"conditions":{{"ready":true}}}}"#))
+        .collect();
+    let list = format!(
+        r#"{{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","metadata":{{"resourceVersion":"1"}},"items":[{{"metadata":{{"name":"cache-peers-x","namespace":"default","resourceVersion":"1","labels":{{"kubernetes.io/service-name":"cache-peers"}}}},"addressType":"IPv4","endpoints":[{}],"ports":[{{"name":"http","port":8080,"protocol":"TCP"}}]}}]}}"#,
+        addresses.join(",")
+    );
+    let list = Bytes::from(list);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let limits = Limits {
+        header_timeout: Duration::from_secs(5),
+        connection_timeout: Duration::from_secs(60),
+    };
+    tokio::spawn(http::serve(
+        listener,
+        limits,
+        move |req: Request<Incoming>| {
+            let list = list.clone();
+            async move {
+                let watching = req.uri().query().is_some_and(|q| q.contains("watch=true"));
+                let body = if watching {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                    Bytes::new()
+                } else {
+                    list
+                };
+                let mut resp = http::text(StatusCode::OK, body);
+                resp.headers_mut().insert(
+                    HeaderName::from_static("content-type"),
+                    HeaderValue::from_static("application/json"),
+                );
+                resp
+            }
+        },
+        CancellationToken::new(),
+    ));
+    port
+}
+
+fn kubeconfig(port: u16) -> String {
+    format!(
+        "apiVersion: v1\nkind: Config\ncurrent-context: it\nclusters:\n- name: it\n  cluster:\n    server: http://host.docker.internal:{port}\ncontexts:\n- name: it\n  context:\n    cluster: it\n    user: it\n    namespace: default\nusers:\n- name: it\n  user:\n    token: unused\n"
+    )
+}
+
+fn peer_args(origin_port: u16, ip: &str) -> Vec<String> {
+    base_args(origin_port)
+        .into_iter()
+        .filter(|a| !a.starts_with("--pod-ip"))
+        .chain([
+            format!("--pod-ip={ip}"),
+            format!("--peer-authority={PEER_AUTHORITY}"),
+        ])
+        .collect()
+}
+
+async fn run_peer(dir: &Path, network: &str, ip: &str, origin_port: u16) -> Container {
+    let docker_extra: Vec<String> = [
+        "--network",
+        network,
+        "--ip",
+        ip,
+        "-e",
+        "KUBECONFIG=/config/kubeconfig",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    run_cache_with(dir, &docker_extra, &peer_args(origin_port, ip)).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn peer_purge_uses_the_peer_authority_and_honours_only_trusted_invalidation_hosts() {
+    let (port, origin) = start_origin().await;
+    let kube_port = start_fake_kube(&[PEER_A, PEER_B]).await;
+    let dir = temp_dir("peers");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    std::fs::write(dir.join("kubeconfig"), kubeconfig(kube_port)).unwrap();
+    let name = format!("stalewise-it-peers-{}", std::process::id());
+    docker(&["network", "create", "--subnet", PEER_SUBNET, &name]);
+    let network = Network(name);
+    let a = run_peer(&dir, &network.0, PEER_A, port).await;
+    let b = run_peer(&dir, &network.0, PEER_B, port).await;
+    // Readiness precedes the first discovery-rendered VCL, which is what admits peers.
+    for c in [&a, &b] {
+        wait_for("peer-aware VCL", Duration::from_secs(30), async || {
+            logs(&c.id).contains("activated VCL")
+        })
+        .await;
+    }
+    warm(b.traffic).await;
+
+    request(b.traffic, "GET", "/cache", "").await;
+    let spoof = "X-Stalewise-Host: other.test\r\n";
+    assert!(
+        request(b.traffic, "GET", "/cache", spoof).await.is_hit(),
+        "a client X-Stalewise-Host never changes the cache key"
+    );
+    assert_eq!(
+        request(b.traffic, "PURGE", "/cache", spoof).await.status,
+        403,
+        "a non-ACL client cannot purge with or without the header"
+    );
+    assert!(request(b.traffic, "GET", "/cache", "").await.is_hit());
+    let before = hits(&origin, "/cache");
+
+    let auth = format!("Authorization: Bearer {TOKEN}\r\n");
+    assert_eq!(
+        request(a.signaller, "PURGE", "/cache", &auth).await.status,
+        202
+    );
+    wait_for("peer purge delivery", Duration::from_secs(10), async || {
+        !request(b.traffic, "GET", "/cache", "").await.is_hit()
+    })
+    .await;
+    assert_eq!(hits(&origin, "/cache"), before + 1);
+    assert_eq!(
+        metric(
+            a.management,
+            "stalewise_signaller_exhausted_deliveries_total"
+        )
+        .await,
+        0.0,
+        "{}",
+        logs(&a.id)
+    );
 }

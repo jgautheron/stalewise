@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stalewise.fullname" . }}
+  labels:
+    {{- include "stalewise.labels" . | nindent 4 }}
+    app.kubernetes.io/component: traffic
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "stalewise.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.signaller.enabled }}
+    - name: http-signaller
+      port: {{ .Values.ports.signaller }}
+      targetPort: signaller
+      protocol: TCP
+    {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stalewise.fullname" . }}-peers
+  labels:
+    {{- include "stalewise.labels" . | nindent 4 }}
+    app.kubernetes.io/component: peers
+spec:
+  clusterIP: None
+  selector:
+    {{- include "stalewise.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.ports.http }}
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "stalewise.fullname" . }}-management
+  labels:
+    {{- include "stalewise.labels" . | nindent 4 }}
+    app.kubernetes.io/component: management
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "stalewise.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http-management
+      port: {{ .Values.ports.management }}
+      targetPort: management
+      protocol: TCP

@@ -1,0 +1,234 @@
+{{- $fullname := include "stalewise.fullname" . -}}
+{{- if eq .Values.profile "mesh" }}
+{{- if not .Values.canonicalHost }}{{ fail "canonicalHost is required for the mesh profile" }}{{ end }}
+{{- end }}
+{{- $watch := and .Values.backend.watch (ne .Values.profile "mesh") -}}
+{{- if and $watch (not .Values.backend.service) }}{{ fail "backend.service is required when watching origins" }}{{ end }}
+{{- if and (not $watch) (not .Values.backend.host) }}{{ fail "backend.host is required for a static origin" }}{{ end }}
+{{- if and .Values.signaller.enabled (not .Values.signaller.tokenSecret.name) }}{{ fail "signaller.tokenSecret.name is required" }}{{ end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "stalewise.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "stalewise.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "stalewise.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- if .Values.template.inline }}
+        checksum/template: {{ .Values.template.inline | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "stalewise.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stalewise
+          image: {{ include "stalewise.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.extraArgs }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: STALEWISE_PROFILE
+              value: {{ .Values.profile | quote }}
+            - name: STALEWISE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: STALEWISE_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: STALEWISE_FRONTEND_SERVICE
+              value: {{ printf "%s-peers" $fullname | quote }}
+            - name: STALEWISE_FRONTEND_SERVICE_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" $fullname .Release.Namespace | quote }}
+            - name: STALEWISE_FRONTEND_PORT_NAME
+              value: http
+            - name: STALEWISE_BACKEND_WATCH
+              value: {{ $watch | quote }}
+            {{- if $watch }}
+            - name: STALEWISE_BACKEND_SERVICE
+              value: {{ .Values.backend.service | quote }}
+            - name: STALEWISE_BACKEND_PORT_NAME
+              value: {{ .Values.backend.portName | quote }}
+            {{- else }}
+            - name: STALEWISE_BACKEND_HOST
+              value: {{ .Values.backend.host | quote }}
+            - name: STALEWISE_BACKEND_PORT
+              value: {{ .Values.backend.port | quote }}
+            {{- end }}
+            - name: STALEWISE_BACKEND_PROBE_PATH
+              value: {{ .Values.backend.probePath | quote }}
+            {{- with .Values.canonicalHost }}
+            - name: STALEWISE_CANONICAL_HOST
+              value: {{ . | quote }}
+            {{- end }}
+            - name: STALEWISE_ALLOW_EMPTY_BACKENDS
+              value: {{ .Values.allowEmptyBackends | quote }}
+            - name: STALEWISE_LISTEN
+              value: {{ printf "0.0.0.0:%v" .Values.ports.http | quote }}
+            - name: STALEWISE_MANAGEMENT_LISTEN
+              value: {{ printf "0.0.0.0:%v" .Values.ports.management | quote }}
+            - name: STALEWISE_WORK_DIR
+              value: /var/lib/stalewise
+            - name: STALEWISE_VARNISH_WORK_DIR
+              value: /var/lib/varnish
+            - name: STALEWISE_STORAGE
+              value: {{ .Values.storage | quote }}
+            - name: STALEWISE_MAX_VCLS
+              value: {{ .Values.maxVcls | quote }}
+            - name: STALEWISE_UNCACHEABLE_TTL
+              value: {{ .Values.uncacheableTtl | quote }}
+            - name: STALEWISE_MAX_OBJECT_SIZE
+              value: {{ .Values.maxObjectSize | quote }}
+            - name: STALEWISE_PURGE_ACL
+              value: {{ include "stalewise.purgeAcl" . | quote }}
+            - name: STALEWISE_LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            {{- with .Values.varnishParams }}
+            - name: STALEWISE_VARNISH_PARAM
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with (include "stalewise.templatePath" .) }}
+            - name: STALEWISE_TEMPLATE
+              value: {{ . | quote }}
+            - name: STALEWISE_TEMPLATE_POLL
+              value: {{ $.Values.template.pollInterval | quote }}
+            {{- end }}
+            {{- with .Values.template.env }}
+            - name: STALEWISE_TEMPLATE_ENV
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.signaller.enabled }}
+            - name: STALEWISE_SIGNALLER
+              value: "true"
+            - name: STALEWISE_SIGNALLER_LISTEN
+              value: {{ printf "0.0.0.0:%v" .Values.ports.signaller | quote }}
+            - name: STALEWISE_SIGNALLER_TOKEN_FILE
+              value: {{ printf "/etc/stalewise/token/%s" .Values.signaller.tokenSecret.key | quote }}
+            - name: STALEWISE_SIGNALLER_METHODS
+              value: {{ join "," .Values.signaller.methods | quote }}
+            - name: STALEWISE_DELIVERY_DEADLINE
+              value: {{ .Values.signaller.deliveryDeadline | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ports.http }}
+              protocol: TCP
+            - name: management
+              containerPort: {{ .Values.ports.management }}
+              protocol: TCP
+            {{- if .Values.signaller.enabled }}
+            - name: signaller
+              containerPort: {{ .Values.ports.signaller }}
+              protocol: TCP
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: management
+            periodSeconds: 2
+            failureThreshold: 45
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: management
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: management
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: work
+              mountPath: /var/lib/stalewise
+            - name: varnish
+              mountPath: /var/lib/varnish
+            - name: tmp
+              mountPath: /tmp
+            {{- if include "stalewise.templatePath" . }}
+            - name: template
+              mountPath: /etc/stalewise/template
+              readOnly: true
+            {{- end }}
+            {{- if .Values.signaller.enabled }}
+            - name: token
+              mountPath: /etc/stalewise/token
+              readOnly: true
+            {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: work
+          emptyDir: {}
+        - name: varnish
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        {{- if include "stalewise.templatePath" . }}
+        - name: template
+          configMap:
+            name: {{ default (printf "%s-template" $fullname) .Values.template.existingConfigMap }}
+        {{- end }}
+        {{- if .Values.signaller.enabled }}
+        - name: token
+          secret:
+            secretName: {{ .Values.signaller.tokenSecret.name }}
+            defaultMode: 0440
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

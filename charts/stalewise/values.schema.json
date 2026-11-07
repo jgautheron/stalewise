@@ -1,0 +1,387 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "stalewise chart values",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^(sha256:[0-9a-f]{64})?$"
+        },
+        "pullPolicy": {
+          "enum": [
+            "Always",
+            "IfNotPresent",
+            "Never"
+          ]
+        }
+      },
+      "required": [
+        "repository"
+      ]
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "profile": {
+      "enum": [
+        "generic",
+        "mesh"
+      ]
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "watch": {
+          "type": "boolean"
+        },
+        "service": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)?$"
+        },
+        "portName": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]{1,15}$"
+        },
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "probePath": {
+          "type": "string",
+          "pattern": "^/[A-Za-z0-9/._~%?=&-]*$"
+        }
+      }
+    },
+    "canonicalHost": {
+      "type": "string"
+    },
+    "allowEmptyBackends": {
+      "type": "boolean"
+    },
+    "ports": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "http": {
+          "type": "integer",
+          "minimum": 1025,
+          "maximum": 65535
+        },
+        "signaller": {
+          "type": "integer",
+          "minimum": 1025,
+          "maximum": 65535
+        },
+        "management": {
+          "type": "integer",
+          "minimum": 1025,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "http",
+        "signaller",
+        "management"
+      ]
+    },
+    "storage": {
+      "type": "string",
+      "minLength": 1
+    },
+    "maxVcls": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "uncacheableTtl": {
+      "type": "string",
+      "pattern": "^[0-9]+(ms|s|m)$"
+    },
+    "maxObjectSize": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "varnishParams": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z_]+=[^\\s,]+$"
+      }
+    },
+    "logLevel": {
+      "type": "string",
+      "minLength": 1
+    },
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingConfigMap": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inline": {
+          "type": "string"
+        },
+        "pollInterval": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m)$"
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          }
+        }
+      }
+    },
+    "signaller": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "tokenSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "methods": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "PURGE",
+              "BAN"
+            ]
+          }
+        },
+        "peerCIDRs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F:.]+(/[0-9]{1,3})?$"
+          }
+        },
+        "deliveryDeadline": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m)$"
+        }
+      }
+    },
+    "purgeAcl": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-fA-F:.]+(/[0-9]{1,3})?$"
+      }
+    },
+    "mesh": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sidecar": {
+          "type": "boolean"
+        },
+        "authorizationPolicy": {
+          "type": "boolean"
+        },
+        "trustDomain": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object"
+        }
+      }
+    },
+    "podAnnotations": {
+      "type": "object"
+    },
+    "podLabels": {
+      "type": "object"
+    },
+    "resources": {
+      "type": "object"
+    },
+    "nodeSelector": {
+      "type": "object"
+    },
+    "tolerations": {
+      "type": "array"
+    },
+    "affinity": {
+      "type": "object"
+    },
+    "topologySpreadConstraints": {
+      "type": "array"
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 35
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "ClusterIP",
+            "NodePort",
+            "LoadBalancer"
+          ]
+        },
+        "annotations": {
+          "type": "object"
+        }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "maxUnavailable": {
+          "type": [
+            "integer",
+            "string"
+          ]
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "trafficFrom": {
+          "type": "array"
+        },
+        "managementFrom": {
+          "type": "array"
+        },
+        "signallerFrom": {
+          "type": "array"
+        }
+      }
+    },
+    "extraContainers": {
+      "type": "array"
+    },
+    "extraArgs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "mesh"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "canonicalHost": {
+            "minLength": 1
+          },
+          "backend": {
+            "properties": {
+              "host": {
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "signaller": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "signaller": {
+            "properties": {
+              "tokenSecret": {
+                "properties": {
+                  "name": {
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

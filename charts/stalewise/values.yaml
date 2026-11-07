@@ -1,0 +1,98 @@
+# Image; set digest to pin an exact build.
+image:
+  repository: ghcr.io/jgautheron/stalewise
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicaCount: 2
+
+# generic watches origin EndpointSlices; mesh uses one Service DNS origin.
+profile: generic
+
+backend:
+  watch: true
+  service: ""
+  portName: http
+  host: ""
+  port: 8080
+  probePath: /
+
+# Host every request is normalised to; required for the mesh profile.
+canonicalHost: ""
+allowEmptyBackends: false
+
+ports:
+  http: 8080
+  signaller: 8081
+  management: 9090
+
+storage: malloc,256m
+maxVcls: 5
+uncacheableTtl: 30s
+maxObjectSize: 10485760
+varnishParams: []
+logLevel: info
+
+# Optional raw VCL template; trusted executable configuration.
+template:
+  existingConfigMap: ""
+  key: template.vcl
+  inline: ""
+  pollInterval: 2s
+  env: []
+
+signaller:
+  enabled: false
+  # Secret holding the bearer token (32-256 visible bytes).
+  tokenSecret:
+    name: ""
+    key: token
+  methods: [PURGE, BAN]
+  # Pod CIDRs peers send from; required when enabled without a sidecar.
+  peerCIDRs: []
+  deliveryDeadline: 10s
+
+# Extra purge ACL entries beyond loopback and the signaller defaults.
+purgeAcl: []
+
+mesh:
+  # The pod runs an Istio-style sidecar that delivers inbound traffic from 127.0.0.6.
+  sidecar: false
+  # Deny PURGE/BAN at the sidecar unless the caller is this cache's service account.
+  authorizationPolicy: false
+  trustDomain: cluster.local
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+terminationGracePeriodSeconds: 40
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: false
+  # NetworkPolicyPeer lists; empty means any source in the namespace's cluster.
+  trafficFrom: []
+  managementFrom: []
+  signallerFrom: []
+
+# Sidecars such as a Varnish exporter; mount the "varnish" volume read-only for VSM.
+extraContainers: []
+extraArgs: []

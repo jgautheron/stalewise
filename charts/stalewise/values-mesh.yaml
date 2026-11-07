@@ -1,0 +1,17 @@
+# Mesh profile: one Service DNS origin balanced by the sidecar, peers purge via 127.0.0.6.
+profile: mesh
+backend:
+  watch: false
+  host: catalog.apps.svc.cluster.local
+  port: 8080
+canonicalHost: catalog.apps.svc.cluster.local
+signaller:
+  enabled: true
+  tokenSecret:
+    name: catalog-cache-signaller
+    key: token
+mesh:
+  sidecar: true
+  authorizationPolicy: true
+podAnnotations:
+  sidecar.istio.io/inject: "true"

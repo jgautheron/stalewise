@@ -1,0 +1,22 @@
+{{- if and .Values.mesh.sidecar .Values.mesh.authorizationPolicy }}
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: {{ include "stalewise.fullname" . }}-invalidation
+  labels:
+    {{- include "stalewise.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "stalewise.selectorLabels" . | nindent 6 }}
+  action: DENY
+  rules:
+    - from:
+        - source:
+            notPrincipals:
+              - {{ printf "%s/ns/%s/sa/%s" .Values.mesh.trustDomain .Release.Namespace (include "stalewise.serviceAccountName" .) | quote }}
+      to:
+        - operation:
+            methods: ["PURGE", "BAN"]
+            ports: [{{ .Values.ports.http | quote }}]
+{{- end }}

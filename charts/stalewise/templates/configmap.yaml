@@ -1,0 +1,11 @@
+{{- if and .Values.template.inline (not .Values.template.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "stalewise.fullname" . }}-template
+  labels:
+    {{- include "stalewise.labels" . | nindent 4 }}
+data:
+  {{ .Values.template.key }}: |
+    {{- .Values.template.inline | nindent 4 }}
+{{- end }}

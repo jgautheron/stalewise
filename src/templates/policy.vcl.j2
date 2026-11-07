@@ -53,9 +53,9 @@ sub vcl_recv {
         if (!req.http.Host || req.http.X-Stalewise-Tag !~ "^[A-Za-z0-9_-]{1,128}$") {
             return (synth(400, "Bad Request"));
         }
-        # Host and tag are validated above, so neither can alter the fixed expression.
-        if (std.ban({"obj.http.X-Stalewise-Host == ""} + req.http.Host +
-            {"" && obj.http.X-Stalewise-Tags ~ " "} + req.http.X-Stalewise-Tag + {" ""})) {
+        # std.ban splits on whitespace without unquoting; validated values contain neither.
+        if (std.ban("obj.http.X-Stalewise-Host == " + req.http.Host +
+            " && obj.http.X-Stalewise-Tags ~ ," + req.http.X-Stalewise-Tag + ",")) {
             return (synth(200, "Banned"));
         }
         return (synth(400, "Bad Request"));
@@ -246,14 +246,14 @@ sub stalewise_tags {
     std.collect(beresp.http.Surrogate-Key, " ");
     std.collect(beresp.http.Cache-Tag, ",");
     set beresp.http.X-Stalewise-Tags = regsuball(
-        beresp.http.Surrogate-Key + " " + beresp.http.Cache-Tag, "[\s,]+", " ");
-    set beresp.http.X-Stalewise-Tags = regsuball(beresp.http.X-Stalewise-Tags, "^ +| +$", "");
+        beresp.http.Surrogate-Key + " " + beresp.http.Cache-Tag, "[\s,]+", ",");
+    set beresp.http.X-Stalewise-Tags = regsuball(beresp.http.X-Stalewise-Tags, "^,+|,+$", "");
     if (beresp.http.X-Stalewise-Tags == "" ||
-        beresp.http.X-Stalewise-Tags !~ "^[ A-Za-z0-9_-]{1,4094}$" ||
+        beresp.http.X-Stalewise-Tags !~ "^[,A-Za-z0-9_-]{1,4094}$" ||
         beresp.http.X-Stalewise-Tags ~ "[A-Za-z0-9_-]{129}") {
         unset beresp.http.X-Stalewise-Tags;
     } else {
-        set beresp.http.X-Stalewise-Tags = " " + beresp.http.X-Stalewise-Tags + " ";
+        set beresp.http.X-Stalewise-Tags = "," + beresp.http.X-Stalewise-Tags + ",";
     }
 }
 

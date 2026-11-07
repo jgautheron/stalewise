@@ -150,8 +150,9 @@ pub struct Cli {
     pub signaller_listen: SocketAddr,
     #[arg(long, env = "STALEWISE_SIGNALLER_TOKEN_FILE")]
     pub signaller_token_file: Option<PathBuf>,
-    #[arg(long, env = "STALEWISE_POD_IP")]
-    pub pod_ip: Option<IpAddr>,
+    /// Every address of this pod; dual-stack pods list both families.
+    #[arg(long, env = "STALEWISE_POD_IP", value_delimiter = ',', action = ArgAction::Append)]
+    pub pod_ip: Vec<IpAddr>,
     #[arg(long, env = "STALEWISE_SIGNALLER_METHODS", value_enum, value_delimiter = ',', action = ArgAction::Append)]
     pub signaller_methods: Vec<Method>,
     #[arg(long, env = "STALEWISE_SIGNALLER_BODY_LIMIT", default_value_t = 65536)]
@@ -234,7 +235,7 @@ pub struct VarnishParam {
 pub struct SignalConfig {
     pub listen: SocketAddr,
     pub token_file: PathBuf,
-    pub pod_ip: IpAddr,
+    pub pod_ips: Vec<IpAddr>,
     pub local_frontend: SocketAddr,
     pub canonical_host: Option<Authority>,
     pub methods: Vec<Method>,
@@ -443,9 +444,9 @@ fn signal_config(
         .signaller_token_file
         .clone()
         .ok_or_else(|| invalid("--signaller-token-file", "is required with --signaller"))?;
-    let pod_ip = cli
-        .pod_ip
-        .ok_or_else(|| invalid("--pod-ip", "is required with --signaller"))?;
+    if cli.pod_ip.is_empty() {
+        return Err(invalid("--pod-ip", "is required with --signaller"));
+    }
     let mut methods = cli.signaller_methods.clone();
     if methods.is_empty() {
         methods = vec![Method::Purge, Method::Ban];
@@ -459,7 +460,7 @@ fn signal_config(
     Ok(Some(SignalConfig {
         listen: cli.signaller_listen,
         token_file,
-        pod_ip,
+        pod_ips: cli.pod_ip.clone(),
         local_frontend: SocketAddr::new(local_ip, cli.listen.port()),
         canonical_host,
         methods,
@@ -747,8 +748,9 @@ mod tests {
         let mut args = BASE.to_vec();
         args.push("--signaller");
         assert!(parse(&args).is_err());
-        args.extend(["--signaller-token-file=/t", "--pod-ip=fd00::7"]);
+        args.extend(["--signaller-token-file=/t", "--pod-ip=10.0.0.7,fd00::7"]);
         let sig = parse(&args).unwrap().signaller.unwrap();
+        assert_eq!(sig.pod_ips.len(), 2, "dual-stack downward API value splits");
         assert_eq!(sig.methods, [Method::Purge, Method::Ban]);
         assert_eq!(sig.local_frontend, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(sig.workers, 4);

@@ -89,7 +89,7 @@ CLI overrides environment, then profile defaults. List-valued flags are comma-se
 | `--signaller` | `STALEWISE_SIGNALLER` | false |
 | `--signaller-listen` | `STALEWISE_SIGNALLER_LISTEN` | 0.0.0.0:8081 |
 | `--signaller-token-file` | `STALEWISE_SIGNALLER_TOKEN_FILE` | required when enabled |
-| `--pod-ip` | `STALEWISE_POD_IP` | required when enabled |
+| `--pod-ip` | `STALEWISE_POD_IP` | required when enabled; comma-separated pod IPs |
 | `--signaller-methods` | `STALEWISE_SIGNALLER_METHODS` | PURGE,BAN |
 | `--signaller-body-limit` | `STALEWISE_SIGNALLER_BODY_LIMIT` | 65536 bytes |
 | `--signaller-workers` | `STALEWISE_SIGNALLER_WORKERS` | 4 |

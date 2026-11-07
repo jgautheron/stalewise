@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures_util::StreamExt;
-use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::discovery::v1::{Endpoint as SliceEndpoint, EndpointSlice};
 use kube::Api;
 use kube::runtime::watcher::{self, Event};
 use tokio::sync::watch;
@@ -39,9 +39,11 @@ pub struct Discovery {
     pub error: Option<DiscoveryError>,
 }
 
-/// Merges every slice into deduplicated endpoints sorted by numeric address then port.
+/// Merges every slice into one endpoint per pod, sorted by numeric address then port.
+///
+/// A dual-stack pod appears once per family; its lowest address (IPv4 first) represents it.
 pub fn merge(slices: &[EndpointSlice], port: &str) -> Result<Vec<Endpoint>, DiscoveryError> {
-    let mut set: BTreeSet<(IpAddr, u16)> = BTreeSet::new();
+    let mut by_pod: BTreeMap<String, (IpAddr, u16)> = BTreeMap::new();
     for slice in slices {
         let Some(number) = slice_port(slice, port)? else {
             continue;
@@ -51,24 +53,54 @@ pub fn merge(slices: &[EndpointSlice], port: &str) -> Result<Vec<Endpoint>, Disc
             "IPv6" => true,
             _ => continue,
         };
-        let usable = slice.endpoints.iter().filter(|e| {
-            let conditions = e.conditions.as_ref();
-            conditions.and_then(|c| c.ready) != Some(false)
-                && conditions.and_then(|c| c.terminating) != Some(true)
-        });
-        for address in usable.flat_map(|e| e.addresses.iter()) {
-            match address.parse::<IpAddr>() {
-                Ok(ip) if ip.is_ipv6() == family_v6 => {
-                    set.insert((ip, number));
-                }
-                _ => tracing::warn!(address = %address, "ignoring invalid EndpointSlice address"),
+        for endpoint in slice.endpoints.iter().filter(|e| usable(e)) {
+            for ip in addresses(endpoint, family_v6) {
+                let key = pod_key(endpoint).unwrap_or_else(|| ip.to_string());
+                let candidate = (ip, number);
+                by_pod
+                    .entry(key)
+                    .and_modify(|kept| *kept = (*kept).min(candidate))
+                    .or_insert(candidate);
             }
         }
     }
+    let set: BTreeSet<(IpAddr, u16)> = by_pod.into_values().collect();
     Ok(set
         .into_iter()
         .map(|(ip, port)| Endpoint::new(Host::Ip(ip), port))
         .collect())
+}
+
+fn usable(endpoint: &SliceEndpoint) -> bool {
+    let conditions = endpoint.conditions.as_ref();
+    conditions.and_then(|c| c.ready) != Some(false)
+        && conditions.and_then(|c| c.terminating) != Some(true)
+}
+
+fn addresses(endpoint: &SliceEndpoint, family_v6: bool) -> impl Iterator<Item = IpAddr> + '_ {
+    endpoint
+        .addresses
+        .iter()
+        .filter_map(move |address| match address.parse::<IpAddr>() {
+            Ok(ip) if ip.is_ipv6() == family_v6 => Some(ip),
+            _ => {
+                tracing::warn!(address = %address, "ignoring invalid EndpointSlice address");
+                None
+            }
+        })
+}
+
+/// The owning pod, so one pod's per-family endpoints collapse to a single peer.
+fn pod_key(endpoint: &SliceEndpoint) -> Option<String> {
+    let target = endpoint.target_ref.as_ref()?;
+    if let Some(uid) = &target.uid {
+        return Some(uid.clone());
+    }
+    let name = target.name.as_ref()?;
+    Some(format!(
+        "{}/{name}",
+        target.namespace.as_deref().unwrap_or_default()
+    ))
 }
 
 /// The named TCP port of a slice, if it exposes one.
@@ -376,6 +408,35 @@ mod tests {
             ["10.0.0.9:80", "10.0.0.10:80", "[fd00::2]:80"]
         );
         assert_eq!(merged[2].name, "ip_fd00__2_80_v6");
+    }
+
+    #[test]
+    fn dual_stack_pod_is_one_peer_and_unowned_addresses_stay_distinct() {
+        let pod = |name: &str| json!({"kind": "Pod", "namespace": "apps", "name": name});
+        let v4 = slice(
+            "v4",
+            "IPv4",
+            http(80),
+            json!([
+                {"addresses": ["10.0.0.2"], "targetRef": pod("a")},
+                {"addresses": ["10.0.0.3"], "targetRef": pod("b")},
+                {"addresses": ["10.0.0.9"]},
+            ]),
+        );
+        let v6 = slice(
+            "v6",
+            "IPv6",
+            http(80),
+            json!([
+                {"addresses": ["fd00::2"], "targetRef": pod("a")},
+                {"addresses": ["fd00::3"], "targetRef": pod("b")},
+                {"addresses": ["fd00::9"]},
+            ]),
+        );
+        assert_eq!(
+            names(&merge(&[v6, v4], "http").unwrap()),
+            ["10.0.0.2:80", "10.0.0.3:80", "10.0.0.9:80", "[fd00::9]:80"]
+        );
     }
 
     #[test]

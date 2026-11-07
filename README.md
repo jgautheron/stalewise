@@ -69,6 +69,7 @@ The embedded templates cache only what the origin's headers allow.
 ## Invalidation
 
 Enable the signaller with `--signaller`, `--signaller-token-file` and `--pod-ip`.
+On a dual-stack pod, pass every pod address to `--pod-ip` as a comma-separated list.
 Callers send `PURGE` for one URL, or `BAN` with exactly one `X-Stalewise-Tag` header, to port 8081 with `Authorization: Bearer <token>`.
 A `202 Accepted` response means the request is queued in memory, not that every peer purged it.
 

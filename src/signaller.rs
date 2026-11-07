@@ -354,7 +354,7 @@ pub fn targets(config: &SignalConfig, snapshot: &Option<Discovery>) -> Vec<Socke
         .iter()
         .flat_map(|d| d.endpoints.iter())
         .filter_map(|e| match e.host {
-            crate::endpoint::Host::Ip(ip) if ip != config.pod_ip => {
+            crate::endpoint::Host::Ip(ip) if !config.pod_ips.contains(&ip) => {
                 Some(SocketAddr::new(ip, e.port))
             }
             _ => None,
@@ -546,7 +546,7 @@ mod tests {
         SignalConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             token_file: "/unused".into(),
-            pod_ip: "10.9.9.9".parse().unwrap(),
+            pod_ips: vec!["10.9.9.9".parse().unwrap(), "fd00::9".parse().unwrap()],
             local_frontend: local,
             canonical_host: Some("catalog.apps.svc".parse().unwrap()),
             methods: vec![Method::Purge, Method::Ban],
@@ -669,12 +669,13 @@ mod tests {
     }
 
     #[test]
-    fn targets_drop_own_pod_ip_add_loopback_and_format_ipv6() {
+    fn targets_drop_every_own_pod_ip_add_loopback_and_format_ipv6() {
         let local: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let cfg = config(local, 8, Duration::from_secs(1));
-        let own = SocketAddr::new(cfg.pod_ip, 8080);
+        let own_v4 = SocketAddr::new(cfg.pod_ips[0], 8080);
+        let own_v6 = SocketAddr::new(cfg.pod_ips[1], 8080);
         let v6: SocketAddr = "[fd00::5]:8080".parse().unwrap();
-        let got = targets(&cfg, &snapshot(&[own, v6, v6]));
+        let got = targets(&cfg, &snapshot(&[own_v4, own_v6, v6, v6]));
         assert_eq!(got, [local, v6]);
         assert_eq!(v6.to_string(), "[fd00::5]:8080");
         assert!(matches!(v6.ip(), IpAddr::V6(_)));

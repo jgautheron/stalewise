@@ -63,7 +63,7 @@ spec:
             - name: STALEWISE_POD_IP
               valueFrom:
                 fieldRef:
-                  fieldPath: status.podIP
+                  fieldPath: status.podIPs
             - name: STALEWISE_FRONTEND_SERVICE
               value: {{ printf "%s-peers" $fullname | quote }}
             - name: STALEWISE_FRONTEND_SERVICE_HOST

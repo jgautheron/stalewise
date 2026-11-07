@@ -196,4 +196,46 @@ Test every module: configuration precedence, EndpointSlice merge/relist fixtures
 
 CI runs Docker `varnish:9.1.0`: both templates, header/stale/tag behavior, streaming, reload preservation, process death, and shutdown. Pin image digests; verify uid 1000 rather than trusting the tag. Enforce fmt/clippy/tests/deny; use non-root, read-only root, writable work volumes, separate Services, namespaced RBAC, probes, and pinned signed multi-arch packaging.
 
-Build admin/render/process first, then discovery/reload, signaller/management, packaging. Restore previous template/config to roll back; remove traffic attachment before rolling back binaries. v0.2 owns structured policy/CRDs and attachment validation. v0.3 owns stable membership, consistent hashing, shared-tier routing decisions, and purge-consistency metrics. Delivery deadlines already belong to v0.1.
+Build admin/render/process first, then discovery/reload, signaller/management, packaging. Restore previous template/config to roll back; remove traffic attachment before rolling back binaries. v0.2 owns structured policy/CRDs and attachment validation. v0.3 owns stable membership, opt-in sharding, and observable purge delivery. Shared-tier routing remains deferred. Delivery deadlines already belong to v0.1.
+
+## v0.3
+
+This is a planned contract, not implemented behavior. [ADR 0004](adr/0004-sharding-and-purge-consistency.md) defines routing, failure handling, tests, migration, and rejected alternatives. Existing modules remain responsible; there is no new proxy or controller.
+
+### Configuration and ownership
+
+| Flag | Default | Contract |
+|---|---|---|
+| `--shard` | false | Enable VCL consistent hashing across cache peers. |
+| `--pod-name` | required for sharding/signaller | Identify this pod; the chart supplies the downward API value. |
+| `--membership-debounce` | 5s | Validate 100ms–30s; stabilize frontend membership before reload. |
+| `--shard-local-ttl` | 0s | Validate 0–30s; zero disables non-owner body storage. |
+| `--invalidation-history` | 1024 | Positive maximum retained invalidation records. |
+
+Use the existing flag/environment precedence with matching `STALEWISE_` names. Sharding additionally requires validated `--peer-authority` and `--pod-ip`; reject incomplete configuration before startup. Custom templates must implement this contract or reject sharding, never silently ignore it.
+
+Discovery retains `Peer { pod_name, namespace, address, port }`, including local identity, separately from origin endpoints. It validates Pod references and readiness, sorts by pod name, deduplicates dual-stack endpoints, and publishes hysteresis-filtered snapshots. Reload renders equal-weight peer backends with stable `namespace/pod_name` identifiers and 67 virtual points through `directors.shard().reconfigure(67)`. No Rust request hashing occurs. Empty membership means direct origin; failed discovery/reload preserves working state.
+
+VCL routes normalized authority plus effective URL to one owner, independently of local health observations. Owner requests fetch origin; non-owner misses dial the owner's IP with the peers Host and trusted original-host/hop headers. Received peer requests never forward. One pre-delivery failure permits direct-origin fallback. Bypass/privacy behavior remains unchanged. Local-copy TTL never exceeds owner freshness, and local grace/keep are zero.
+
+### Signaller state and HTTP
+
+The signaller owns `admit(Invalidation) -> Result<Receipt, Rejection>` and `lookup(Id) -> Option<Status>` semantics. Its dispatcher alone transitions peer results monotonically from pending to delivered/exhausted. Delivery means acknowledgment, not a distributed read barrier.
+
+```text
+Status { id, pod, peers: [{ pod, address, status, reason }] }
+status = pending | delivered | exhausted
+reason = null | rejected | deadline | shutdown
+```
+
+Return status JSON with `Cache-Control: no-store`. IDs are 32 hexadecimal characters; reject malformed IDs/durations with 400. Authenticate all status and wait requests using the existing bearer token, returning 401 before lookup. Unknown IDs return 404. Wrong methods return 405. Malformed or duplicated wait controls return 400.
+
+Reserve history and delivery slots atomically. Bound retained peer rows to four times queue capacity. Evict oldest terminal records to fit both limits; never evict pending records. If either budget cannot fit, return 503 without queuing anything. Restart loses history and accepted work; receipts are not durable.
+
+Writes return 202, relative Location, and `X-Stalewise-Pod`. `X-Stalewise-Wait` on writes or `?wait` on status GETs accepts positive `ms/s/m` durations through 30s. Wait returns 200 after all acknowledgments, or 504 with status at timeout. Preserve object queries; strip the wait header before forwarding. Pin polling to the admitting pod. Increase the HTTP connection budget to cover header/body timeouts, the validated wait, and response writing; retain bounded concurrency.
+
+### Observability and implementation handoff
+
+Add histogram `stalewise_invalidation_latency_seconds{result="delivered|exhausted"}` from admission to final target completion. Add gauge `stalewise_invalidation_peers_lagging`: distinct peer identities with any retained pending/exhausted result. Eviction may lower it; it is not proof of coherence. Log IDs and bounded failure reasons, never URLs or credentials.
+
+Implement status first, then membership and VCL forwarding. Require three-instance fills=1, owner-failure fallback, broadcast purge/status, and authenticated wait tests before opt-in rollout. Disable sharding before binary rollback. No TUI or additional product surface is planned.

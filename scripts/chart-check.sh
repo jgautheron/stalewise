@@ -36,6 +36,8 @@ helm template catalog-cache "$chart" --namespace apps --set backend.service=cata
 expect 'name: catalog-cache-stalewise'
 expect 'value: "malloc,64m"'
 expect 'memory: 512Mi'
+expect 'terminationGracePeriodSeconds: 45'
+expect 'value: "10s"'
 if grep -qF 'cachepolicies' "$out"; then fail "policy RBAC rendered while cachePolicies is disabled"; fi
 if grep -qF 'kind: PeerAuthentication' "$out"; then fail "PeerAuthentication rendered by default"; fi
 validate "$out"
@@ -71,4 +73,11 @@ if [[ -n "$(yq 'select(.kind == "NetworkPolicy") | .spec.ingress[] | select(has(
   fail "an ingress rule without sources admits everyone"
 fi
 validate "$out"
+helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog \
+  --set drainDelay=20 --set shutdownTimeout=60 >"$out"
+expect 'terminationGracePeriodSeconds: 85'
+if helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog \
+  --set drainDelay=30 >/dev/null 2>&1; then
+  fail "drainDelay not shorter than shutdownTimeout rendered"
+fi
 echo "chart-check: ok"

@@ -119,7 +119,13 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 topologySpreadConstraints: []
-terminationGracePeriodSeconds: 40
+# Seconds stalewise keeps serving after SIGTERM while /readyz reports draining; 0 disables.
+# No preStop hook: the in-process delay flips readiness at once and is the single timing source.
+drainDelay: 10
+# Seconds for the whole shutdown, drain included; must exceed drainDelay.
+shutdownTimeout: 30
+# Lower bound; the chart renders at least drainDelay + shutdownTimeout + 5.
+terminationGracePeriodSeconds: 45
 
 service:
   type: ClusterIP

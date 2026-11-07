@@ -67,6 +67,12 @@ stalewise --profile=mesh \
 Startup never waits for peers.
 stalewise rejects a backend host equal to the cache's own traffic Service host, because that would loop.
 
+On SIGTERM, `/readyz` answers 503 `draining` at once, the signaller stops admitting invalidations, and Varnish keeps serving for `--drain-delay` (default `10s`, `0` disables).
+Only then is `varnishd` stopped, so clients are not reset while EndpointSlices and proxies still route to the pod.
+The drain counts against `--shutdown-timeout` (default `30s`), and `--drain-delay` must be shorter than that timeout.
+The chart sets `terminationGracePeriodSeconds` to at least `drainDelay + shutdownTimeout + 5`.
+The chart uses no preStop hook, because the in-process delay already covers the drain window and is the only timing source.
+
 Exit codes are `0` after a requested shutdown, `1` for runtime failures including an unexpected `varnishd` exit, and `2` for invalid configuration, secrets or tokens.
 
 ## Caching behaviour
@@ -274,6 +280,16 @@ When `mesh.sidecar` is true with `signaller.enabled` or `shard.enabled`, the cha
 With `shard.enabled`, that policy also denies `x-stalewise-shard-hop` requests from any other identity.
 Set `mesh.peerAuthentication=true` to render a `security.istio.io/v1` PeerAuthentication that requires STRICT mTLS for the cache pods.
 Without it, make sure the mesh already enforces STRICT mTLS, because the AuthorizationPolicy relies on peer identities.
+
+The sidecar must keep forwarding until stalewise has drained.
+Set `terminationDrainDuration` above `drainDelay`, as `values-mesh.yaml` does:
+
+```yaml
+podAnnotations:
+  proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true, "terminationDrainDuration": "15s"}'
+```
+
+Alternatively, set the proxy environment variable `EXIT_ON_ZERO_ACTIVE_CONNECTIONS=true` so the sidecar exits only after its connections close.
 
 ## Attaching traffic with `cache.enabled`
 

@@ -7,6 +7,8 @@
 {{- if and (not $watch) (not .Values.backend.host) }}{{ fail "backend.host is required for a static origin" }}{{ end }}
 {{- if and .Values.signaller.enabled (not .Values.signaller.tokenSecret.name) }}{{ fail "signaller.tokenSecret.name is required" }}{{ end }}
 {{- if and .Values.cachePolicies.enabled (include "stalewise.templatePath" .) }}{{ fail "cachePolicies.enabled conflicts with a raw template" }}{{ end }}
+{{- if ge (int .Values.drainDelay) (int .Values.shutdownTimeout) }}{{ fail "drainDelay must be shorter than shutdownTimeout" }}{{ end }}
+{{- $grace := max (int .Values.terminationGracePeriodSeconds) (add .Values.drainDelay .Values.shutdownTimeout 5) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,7 +36,7 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "stalewise.serviceAccountName" . }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ $grace }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -126,6 +128,10 @@ spec:
               value: {{ .Values.stripRewriteHeaders | quote }}
             - name: STALEWISE_PURGE_ACL
               value: {{ include "stalewise.purgeAcl" . | quote }}
+            - name: STALEWISE_DRAIN_DELAY
+              value: {{ printf "%ds" (int .Values.drainDelay) | quote }}
+            - name: STALEWISE_SHUTDOWN_TIMEOUT
+              value: {{ printf "%ds" (int .Values.shutdownTimeout) | quote }}
             - name: STALEWISE_LOG_LEVEL
               value: {{ .Values.logLevel | quote }}
             {{- with .Values.varnishParams }}

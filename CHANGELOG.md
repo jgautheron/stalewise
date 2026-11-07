@@ -19,6 +19,11 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 - `X-Forwarded-Host`, `X-Original-URL` and `X-Rewrite-URL` are removed from requests before hashing and the origin fetch. `--strip-rewrite-headers=false` (chart `stripRewriteHeaders`) opts out.
 - While a CachePolicy is active, paths with dot segments, empty segments, backslashes, or percent-encoded slash, backslash or unreserved characters pass uncached, so `/shop/./account` can no longer dodge a `/shop/account` bypass rule.
 
+### Fixed
+
+- `kubectl rollout restart` no longer resets client connections. On SIGTERM, `/readyz` answers 503 `draining`, the signaller stops admitting, and Varnish keeps serving for `--drain-delay` (`STALEWISE_DRAIN_DELAY`, default `10s`, `0` disables) before it stops. The delay counts against `--shutdown-timeout` and must be shorter than it.
+- The chart adds `drainDelay` (10) and `shutdownTimeout` (30) and renders `terminationGracePeriodSeconds` as at least `drainDelay + shutdownTimeout + 5`. `values-mesh.yaml` sets the Istio `terminationDrainDuration` so the sidecar outlives the drain.
+
 ### Changed
 
 - **Breaking (chart):** with `networkPolicy.enabled`, an empty `trafficFrom`, `managementFrom` or `signallerFrom` now admits no source on that port instead of every source. Cache pods still reach each other's `http` port.

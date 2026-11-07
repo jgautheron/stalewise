@@ -17,6 +17,8 @@ mesh:
   authorizationPolicy: true
 podAnnotations:
   sidecar.istio.io/inject: "true"
+  # Keeps the sidecar forwarding through drainDelay (10s) plus a margin.
+  proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true, "terminationDrainDuration": "15s"}'
 cachePolicies:
   enabled: true
   policies:

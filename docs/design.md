@@ -35,7 +35,7 @@ Each watcher selects `kubernetes.io/service-name`, matches TCP named ports, and 
 
 Signaller queues `Delivery { request:Arc<Invalidation>, peer:SocketAddr, deadline:Instant }` in bounded `mpsc`, default 1024. Admission reserves the entire peer batch atomically or returns 503. Four workers consume through a dispatcher with at most four in-flight jobs. Snapshot peers plus local Varnish; remove the local pod IP before adding loopback. No forwarding to signaller ports.
 
-A root `CancellationToken` stops admission/producers. Drain accepted deliveries within their deadlines, then SIGTERM and reap Varnish within the remaining 30s shutdown budget; SIGKILL on expiry. Unexpected child exit cancels everything and exits nonzero. Task failures reach main; task panics cannot silently remove supervision.
+A root `CancellationToken` stops admission/producers and turns `/readyz` to 503 `draining`. Keep Varnish serving for `--drain-delay` while accepted deliveries drain within their deadlines, then SIGTERM and reap Varnish within the remaining 30s shutdown budget; SIGKILL on expiry. Unexpected child exit cancels everything and exits nonzero. Task failures reach main; task panics cannot silently remove supervision.
 
 ## Failure direction
 
@@ -89,6 +89,7 @@ CLI overrides environment, then the `--config` file, then profile defaults. List
 | `--max-vcls` | `STALEWISE_MAX_VCLS` | 5 including active |
 | `--startup-timeout` | `STALEWISE_STARTUP_TIMEOUT` | 60s |
 | `--shutdown-timeout` | `STALEWISE_SHUTDOWN_TIMEOUT` | 30s |
+| `--drain-delay` | `STALEWISE_DRAIN_DELAY` | 10s; /readyz reports draining while Varnish serves; 0 disables; must be below the shutdown timeout |
 | `--strip-rewrite-headers` | `STALEWISE_STRIP_REWRITE_HEADERS` | true; removes X-Forwarded-Host, X-Original-URL, X-Rewrite-URL |
 | `--management-listen` | `STALEWISE_MANAGEMENT_LISTEN` | 0.0.0.0:9090 |
 | `--probe-listen` | `STALEWISE_PROBE_LISTEN` | 0.0.0.0:9091; `/healthz` and `/readyz` only, separate connection slots; bare IPv6 accepted |

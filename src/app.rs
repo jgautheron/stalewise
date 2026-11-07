@@ -10,11 +10,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{BackendSource, Config, TemplateSource};
+use crate::controller;
 use crate::discovery::{self, Discovery};
 use crate::endpoint::{Endpoint, Host};
 use crate::metrics::Metrics;
 use crate::mgmt::{self, ManagementConfig, StatusInputs};
-use crate::reload::{self, BackendInput, Inputs, ReloadConfig};
+use crate::reload::{self, Active, BackendInput, Inputs, Policies, ReloadConfig};
 use crate::render::{self, OutputDir, RenderSettings, Template};
 use crate::signaller::{self, TokenDigest};
 use crate::status::{Health, Reason};
@@ -160,12 +161,31 @@ fn template_input(
     rx
 }
 
-async fn discovery_inputs(
+/// Kubernetes-fed inputs; policies stay `None` (headers only) until the controller publishes.
+struct ApiInputs {
+    frontends: watch::Receiver<Option<Discovery>>,
+    backends: BackendInput,
+    policies: watch::Receiver<Option<Policies>>,
+}
+
+async fn api_inputs(
     config: &Config,
     shared: &Shared,
     tasks: &mut Background,
-) -> Result<(watch::Receiver<Option<Discovery>>, BackendInput), StartupError> {
+    active: watch::Receiver<Option<Active>>,
+) -> Result<ApiInputs, StartupError> {
     let client = kube::Client::try_default().await;
+    let (policy_tx, policies) = watch::channel(None);
+    if let Some(policy) = config.policies.clone() {
+        let client = client
+            .as_ref()
+            .map_err(|e| {
+                StartupError::Runtime(format!("--cache-policies needs the Kubernetes API: {e}"))
+            })?
+            .clone();
+        let run = controller::run(client, policy, policy_tx, active, shared.root.clone());
+        tasks.spawn("CachePolicy controller", run);
+    }
     let (front_tx, front_rx) = watch::channel(None);
     let mut spawn_watch = |client: kube::Client, role, tx| {
         let watch = discovery::watch(
@@ -200,7 +220,11 @@ async fn discovery_inputs(
             )));
         }
     };
-    Ok((front_rx, backends))
+    Ok(ApiInputs {
+        frontends: front_rx,
+        backends,
+        policies,
+    })
 }
 
 async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, StartupError> {
@@ -241,7 +265,8 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
 
     let mut tasks = Background::default();
     let template = template_input(&config, &root, &mut tasks);
-    let (frontends, backends) = discovery_inputs(&config, &shared, &mut tasks).await?;
+    let api = api_inputs(&config, &shared, &mut tasks, active_tx.subscribe()).await?;
+    let frontends = api.frontends;
     let admin = AdminConfig {
         addr: config.admin_listen,
         secret_file,
@@ -257,7 +282,8 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
     let mut inputs = Inputs {
         template,
         frontends: frontends.clone(),
-        backends,
+        backends: api.backends,
+        policies: api.policies,
     };
     let initial = tokio::time::timeout(
         config.startup_timeout,

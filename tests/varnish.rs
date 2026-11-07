@@ -657,6 +657,62 @@ async fn run_peer(dir: &Path, network: &str, ip: &str, origin_port: u16) -> Cont
     run_cache_with(dir, &docker_extra, &peer_args(origin_port, ip)).await
 }
 
+fn ttl_policies() -> Vec<stalewise::policy::RenderPolicy> {
+    use stalewise::policy::{self, Candidate, OwnService};
+    let own = OwnService {
+        name: "catalog".into(),
+        port_name: None,
+        port_number: None,
+    };
+    let candidates: Vec<Candidate> = [
+        (
+            "nofresh",
+            "/nofresh",
+            "{ttlSeconds: 60, cookies: {mode: stripListed, names: [analytics]}}\nbypass: [{header: {name: X-Preview, exact: \"true\"}}]",
+        ),
+        ("query", "/q", "{ttlSeconds: 60, key: {queryAllowList: [page]}}"),
+        ("private", "/private", "{ttlSeconds: 60}"),
+        ("cache", "/cache", "{ttlSeconds: 0}"),
+    ]
+    .iter()
+    .map(|(name, prefix, overrides)| {
+        let yaml = format!("serviceRef: {{name: catalog}}\npathPrefix: {prefix}\noverrides: {overrides}\n");
+        let spec = serde_norway::from_str(&yaml).unwrap();
+        Candidate {
+            name: (*name).into(),
+            generation: 1,
+            outcome: policy::validate(name, 1, &spec, &own),
+        }
+    })
+    .collect();
+    policy::resolve(&candidates, &std::collections::BTreeMap::new()).policies
+}
+
+/// Fully rendered generic VCL; it contains no template syntax, so stalewise passes it through.
+fn rendered_policy_vcl(origin_port: u16) -> String {
+    use stalewise::endpoint::{Endpoint, Host};
+    use stalewise::render::{self, Context, RenderSettings};
+    let settings = RenderSettings {
+        env: std::collections::BTreeMap::new(),
+        canonical_host: None,
+        backend_authority: format!("host.docker.internal:{origin_port}")
+            .parse()
+            .unwrap(),
+        purge_acl: vec!["127.0.0.1".parse().unwrap()],
+        peer_purge: false,
+        probe_path: "/".into(),
+        uncacheable_ttl: Duration::from_secs(30),
+        max_object_size: 10_485_760,
+    };
+    let origin = Endpoint::new(
+        Host::Dns("host.docker.internal".parse().unwrap()),
+        origin_port,
+    );
+    let ctx = Context::new(&settings, &[], &[origin], &ttl_policies()).unwrap();
+    let source = Template::embedded(Profile::Generic).source;
+    String::from_utf8(render::render(&source, &ctx).unwrap()).unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; CI runs it"]
 async fn peer_purge_uses_the_peer_authority_and_honours_only_trusted_invalidation_hosts() {
@@ -713,4 +769,61 @@ async fn peer_purge_uses_the_peer_authority_and_honours_only_trusted_invalidatio
         "{}",
         logs(&a.id)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn cache_policy_ttl_overrides_a_headerless_response_but_not_privacy() {
+    let (port, origin) = start_origin().await;
+    let dir = temp_dir("policy-ttl");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    std::fs::write(dir.join("template.vcl"), rendered_policy_vcl(port)).unwrap();
+    let mut args = base_args(port);
+    args.push("--template=/config/template.vcl".into());
+    let c = run_cache(&dir, &args).await;
+    warm(c.traffic).await;
+
+    request(c.traffic, "GET", "/nofresh", "").await;
+    let again = request(c.traffic, "GET", "/nofresh", "").await;
+    assert!(
+        again.is_hit(),
+        "policy TTL stores a response without freshness headers"
+    );
+    assert_eq!(hits(&origin, "/nofresh"), 1);
+    assert!(!again.headers.contains_key("x-stalewise-policy"));
+    let stripped = request(c.traffic, "GET", "/nofresh", "Cookie: analytics=1\r\n").await;
+    assert!(
+        stripped.is_hit(),
+        "listed cookies are stripped before the pass check"
+    );
+    let kept = request(
+        c.traffic,
+        "GET",
+        "/nofresh",
+        "Cookie: analytics=1; session=2\r\n",
+    )
+    .await;
+    assert!(!kept.is_hit(), "undeclared cookies still pass");
+    let preview = request(c.traffic, "GET", "/nofresh", "X-Preview: true\r\n").await;
+    assert!(!preview.is_hit(), "bypass rules win before lookup");
+    assert_eq!(hits(&origin, "/nofresh"), 3);
+
+    request(c.traffic, "GET", "/q?utm=a&page=2", "").await;
+    let same_key = request(c.traffic, "GET", "/q?page=2&utm=b", "").await;
+    assert!(
+        same_key.is_hit(),
+        "only allow-listed query names enter the key"
+    );
+    let other_page = request(c.traffic, "GET", "/q?page=3", "").await;
+    assert!(!other_page.is_hit());
+
+    for path in ["/private", "/cache"] {
+        request(c.traffic, "GET", path, "").await;
+        let again = request(c.traffic, "GET", path, "").await;
+        assert!(
+            !again.is_hit(),
+            "{path}: Set-Cookie and explicit zero never store"
+        );
+        assert_eq!(hits(&origin, path), 2, "{path}");
+    }
 }

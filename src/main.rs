@@ -1,10 +1,12 @@
 use std::process::ExitCode;
 
 use stalewise::app::{self, EXIT_CONFIG, EXIT_RUNTIME};
+use stalewise::config::Startup;
 
 fn main() -> ExitCode {
     let config = match stalewise::config::load() {
-        Ok(config) => config,
+        Ok(Startup::Run(config)) => *config,
+        Ok(Startup::PrintCrd) => return print_crd(),
         Err(err) => {
             eprintln!("stalewise: invalid configuration: {err}");
             return ExitCode::from(EXIT_CONFIG);
@@ -32,4 +34,17 @@ fn main() -> ExitCode {
         }
     };
     runtime.block_on(app::run(config))
+}
+
+fn print_crd() -> ExitCode {
+    match stalewise::policy::crd_yaml() {
+        Ok(yaml) => {
+            print!("{yaml}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("stalewise: cannot serialise the CRD: {err}");
+            ExitCode::from(EXIT_RUNTIME)
+        }
+    }
 }

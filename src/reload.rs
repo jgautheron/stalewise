@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::discovery::{Backoff, Discovery};
 use crate::endpoint::Endpoint;
 use crate::metrics::Metrics;
+use crate::policy::RenderPolicy;
 use crate::render::{self, Context, OutputDir, RenderError, RenderSettings, Template};
 use crate::status::{Health, Reason};
 use crate::varnish::admin::{self, AdminConfig, AdminError, Client, VclName, VclState, VclStatus};
@@ -50,7 +51,12 @@ pub struct Inputs {
     pub template: watch::Receiver<Option<Template>>,
     pub frontends: watch::Receiver<Option<Discovery>>,
     pub backends: BackendInput,
+    /// Accepted CachePolicies; `None` renders headers-only behaviour.
+    pub policies: watch::Receiver<Option<Policies>>,
 }
+
+/// An immutable, ordered set of policies rendered together.
+pub type Policies = Arc<[RenderPolicy]>;
 
 /// The confirmed active configuration.
 #[derive(Debug, Clone)]
@@ -58,18 +64,21 @@ pub struct Active {
     pub name: VclName,
     pub bytes: Arc<[u8]>,
     pub since: Instant,
+    /// Policies the active VCL enforces.
+    pub policies: Policies,
 }
 
 #[derive(Debug, Clone)]
 pub struct InitialVcl {
     pub path: std::path::PathBuf,
     pub bytes: Arc<[u8]>,
+    pub policies: Policies,
 }
 
 enum Candidate {
     Pending,
     Empty,
-    Ready(Arc<[u8]>),
+    Ready(Arc<[u8]>, Policies),
 }
 
 /// Renders the current inputs; `Pending` until a template and an origin snapshot exist.
@@ -93,9 +102,15 @@ fn candidate(config: &ReloadConfig, inputs: &Inputs) -> Result<Candidate, Render
         .as_ref()
         .map(|d| Arc::clone(&d.endpoints))
         .unwrap_or_else(|| Arc::from([]));
-    let context = Context::new(&config.settings, &frontends, &backends)?;
+    let policies = inputs
+        .policies
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| Arc::from([]));
+    let context = Context::new(&config.settings, &frontends, &backends, &policies)?;
     Ok(Candidate::Ready(
         render::render(&template.source, &context)?.into(),
+        policies,
     ))
 }
 
@@ -108,11 +123,15 @@ pub async fn initial(
 ) -> Result<InitialVcl, ReloadError> {
     loop {
         match candidate(config, inputs) {
-            Ok(Candidate::Ready(bytes)) => {
+            Ok(Candidate::Ready(bytes, policies)) => {
                 health.set(Reason::BackendEmpty, false);
                 health.set(Reason::RenderFailed, false);
                 let path = persist(config, INITIAL_FILE, Arc::clone(&bytes)).await??;
-                return Ok(InitialVcl { path, bytes });
+                return Ok(InitialVcl {
+                    path,
+                    bytes,
+                    policies,
+                });
             }
             Ok(Candidate::Pending) => {}
             Ok(Candidate::Empty) => health.set(Reason::BackendEmpty, true),
@@ -153,6 +172,7 @@ async fn changed(inputs: &mut Inputs) {
     tokio::select! {
         () = changed_or_pending(&mut inputs.template) => {}
         () = changed_or_pending(&mut inputs.frontends) => {}
+        () = changed_or_pending(&mut inputs.policies) => {}
         () = backends => {}
     }
 }
@@ -181,7 +201,7 @@ pub async fn run(
         retry_at: None,
         backoff: Backoff::default(),
         persist_pending: false,
-        boot_bytes: Some(initial.bytes),
+        boot: Some((initial.bytes, initial.policies)),
     };
     loop {
         reloader.attempt(&inputs).await;
@@ -211,8 +231,8 @@ struct Reloader {
     retry_at: Option<Instant>,
     backoff: Backoff,
     persist_pending: bool,
-    /// Bytes of the `-f` configuration until its activation is confirmed.
-    boot_bytes: Option<Arc<[u8]>>,
+    /// The `-f` configuration until its activation is confirmed.
+    boot: Option<(Arc<[u8]>, Policies)>,
 }
 
 /// Load order for retention: `boot` first, then generated names by sequence.
@@ -261,8 +281,8 @@ impl Reloader {
         if self.persist_pending {
             self.persist_active().await;
         }
-        let bytes = match candidate(&self.config, inputs) {
-            Ok(Candidate::Ready(bytes)) => bytes,
+        let (bytes, policies) = match candidate(&self.config, inputs) {
+            Ok(Candidate::Ready(bytes, policies)) => (bytes, policies),
             Ok(Candidate::Pending) => return,
             Ok(Candidate::Empty) => return self.health.set(Reason::BackendEmpty, true),
             Err(err) => {
@@ -282,7 +302,7 @@ impl Reloader {
         if self.last_failed == Some(digest) {
             return;
         }
-        self.load(bytes, digest).await;
+        self.load(bytes, policies, digest).await;
     }
 
     /// Confirms the child's `boot` configuration before any reload.
@@ -303,7 +323,7 @@ impl Reloader {
             self.fail(Reason::AdminUnavailable, true);
             return false;
         };
-        let Some(bytes) = self.boot_bytes.take() else {
+        let Some((bytes, policies)) = self.boot.take() else {
             return false;
         };
         self.health.set(Reason::AdminUnavailable, false);
@@ -311,12 +331,13 @@ impl Reloader {
             name: name.clone(),
             bytes,
             since: Instant::now(),
+            policies,
         }));
         self.persist_pending = true;
         true
     }
 
-    async fn load(&mut self, bytes: Arc<[u8]>, digest: [u8; 32]) {
+    async fn load(&mut self, bytes: Arc<[u8]>, policies: Policies, digest: [u8; 32]) {
         self.metrics.reload_attempts.inc();
         let mut client = match self.session_with_room().await {
             Some(client) => client,
@@ -346,7 +367,7 @@ impl Reloader {
         };
         let rejected = matches!(used, Err(AdminError::Command { .. }));
         match confirmed.as_ref().ok().and_then(|l| active_name(l)) {
-            Some(active) if *active == name => self.commit(name, bytes).await,
+            Some(active) if *active == name => self.commit(name, bytes, policies).await,
             Some(_) if rejected => {
                 self.last_failed = Some(digest);
                 self.fail(Reason::ActivationRejected, false);
@@ -390,7 +411,7 @@ impl Reloader {
         Some(client)
     }
 
-    async fn commit(&mut self, name: VclName, bytes: Arc<[u8]>) {
+    async fn commit(&mut self, name: VclName, bytes: Arc<[u8]>, policies: Policies) {
         tracing::info!(vcl = %name, "activated VCL");
         self.metrics.reload_successes.inc();
         self.backoff.reset();
@@ -406,6 +427,7 @@ impl Reloader {
             name,
             bytes,
             since: Instant::now(),
+            policies,
         }));
         self.persist_active().await;
         self.retry_cleanup().await;
@@ -475,12 +497,13 @@ mod tests {
     use std::time::Duration;
     use std::time::SystemTime;
 
-    const TEMPLATE: &str = "vcl 4.1;{% for b in backends %} {{ b.name }}{% endfor %}";
+    const TEMPLATE: &str = "vcl 4.1;{% for b in backends %} {{ b.name }}{% endfor %}{% for p in policies %} {{ p.name }}{% endfor %}";
 
     struct Harness {
         fake: FakeVarnish,
         template: watch::Sender<Option<Template>>,
         backends: watch::Sender<Option<Discovery>>,
+        policies: watch::Sender<Option<Policies>>,
         active: watch::Receiver<Option<Active>>,
         health: Health,
         metrics: Arc<Metrics>,
@@ -523,10 +546,12 @@ mod tests {
             watch::channel(Some(Template::parse(TEMPLATE.as_bytes()).unwrap()));
         let (backends, backends_rx) = watch::channel(snapshot(&["10.0.0.1"]));
         let (frontends_tx, frontends_rx) = watch::channel(None);
+        let (policies, policies_rx) = watch::channel(None);
         let mut inputs = Inputs {
             template: template_rx,
             frontends: frontends_rx,
             backends: BackendInput::Watch(backends_rx),
+            policies: policies_rx,
         };
         let metrics = Arc::new(Metrics::new());
         let health = Health::new(Arc::clone(&metrics));
@@ -554,6 +579,7 @@ mod tests {
             fake,
             template,
             backends,
+            policies,
             active,
             health,
             metrics,
@@ -592,6 +618,27 @@ mod tests {
         let path = h.work.join("run").join(ACTIVE_FILE);
         eventually(|| std::fs::read(&path).ok().as_deref() == Some(&active.bytes[..])).await;
         assert_eq!(h.metrics.reload_successes.get(), 1);
+        h.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn policy_change_reloads_and_active_records_the_policies() {
+        let mut h = start(Behavior::default(), 5).await;
+        let spec = serde_norway::from_str("serviceRef: {name: catalog}\npathPrefix: /api").unwrap();
+        let own = crate::policy::OwnService {
+            name: "catalog".into(),
+            port_name: None,
+            port_number: None,
+        };
+        let policy = crate::policy::validate("catalog-api", 4, &spec, &own).unwrap();
+        h.policies.send_replace(Some(Arc::from([policy])));
+        h.active
+            .wait_for(|a| a.as_ref().is_some_and(|a| a.policies.len() == 1))
+            .await
+            .unwrap();
+        let active = h.active.borrow().clone().unwrap();
+        assert!(active.bytes.ends_with(b" catalog-api"));
+        assert_eq!(active.policies[0].generation, 4);
         h.stop.cancel();
     }
 

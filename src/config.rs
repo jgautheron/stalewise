@@ -1,14 +1,25 @@
 //! Command-line and environment configuration, validated once at startup.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use hyper::header::HeaderValue;
+use serde_norway::Value;
 
 use crate::endpoint::{AddressError, Authority, Cidr, DnsName, Host};
+use crate::policy::OwnService;
+
+/// `apiVersion` every config file must declare.
+pub const CONFIG_API_VERSION: &str = "stalewise.dev/v1alpha1";
+/// `kind` every config file must declare.
+pub const CONFIG_KIND: &str = "Config";
+const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
 /// Invalid startup configuration; the process exits with code 2.
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +28,15 @@ pub enum ConfigError {
     Invalid { flag: &'static str, reason: String },
     #[error(transparent)]
     Address(#[from] AddressError),
+    #[error("config file {path}: {reason}")]
+    File { path: PathBuf, reason: String },
+}
+
+fn file_error(path: &Path, reason: impl Into<String>) -> ConfigError {
+    ConfigError::File {
+        path: path.to_owned(),
+        reason: reason.into(),
+    }
 }
 
 fn invalid(flag: &'static str, reason: impl Into<String>) -> ConfigError {
@@ -76,7 +96,13 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
     version,
     about = "Supervises Varnish as a Kubernetes-aware HTTP cache"
 )]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Subcommands>,
+    /// YAML file with the same settings as the flags; CLI and environment win over it.
+    #[arg(long, env = "STALEWISE_CONFIG")]
+    pub config: Option<PathBuf>,
     #[arg(long, env = "STALEWISE_PROFILE", value_enum, default_value = "generic")]
     pub profile: Profile,
     #[arg(long, env = "STALEWISE_NAMESPACE", default_value = "default")]
@@ -187,6 +213,31 @@ pub struct Cli {
     pub max_object_size: u64,
     #[arg(long, env = "STALEWISE_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+    /// Watch CachePolicy resources for the cached Service and render them.
+    #[arg(long, env = "STALEWISE_CACHE_POLICIES", num_args = 0..=1, default_missing_value = "true", default_value = "false", action = ArgAction::Set)]
+    pub cache_policies: bool,
+    /// Service name policies must reference; defaults to the origin Service.
+    #[arg(long, env = "STALEWISE_POLICY_SERVICE")]
+    pub policy_service: Option<String>,
+    /// Report VirtualService attachment on CachePolicy status; defaults to --cache-policies.
+    #[arg(long, env = "STALEWISE_VALIDATE_ATTACHMENT", num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    pub validate_attachment: Option<bool>,
+    /// Labels every cache pod carries, as key=value; checked against route source bypasses.
+    #[arg(long, env = "STALEWISE_CACHE_SOURCE_LABELS", value_delimiter = ',', action = ArgAction::Append)]
+    pub cache_source_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum Subcommands {
+    /// Print the CachePolicy CustomResourceDefinition as YAML.
+    Crd,
+}
+
+/// What the process was asked to do.
+#[derive(Debug)]
+pub enum Startup {
+    Run(Box<Config>),
+    PrintCrd,
 }
 
 const DEFAULT_PURGE_ACL: [&str; 2] = ["127.0.0.1/32", "::1/128"];
@@ -289,11 +340,134 @@ pub struct Config {
     pub uncacheable_ttl: Duration,
     pub max_object_size: u64,
     pub log_level: String,
+    pub policies: Option<PolicyConfig>,
 }
 
-/// Parses process arguments and environment; clap usage errors exit 2 itself.
-pub fn load() -> Result<Config, ConfigError> {
-    Config::from_cli(Cli::parse(), |name| std::env::var(name).ok())
+/// CachePolicy watching for one cached Service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyConfig {
+    pub namespace: String,
+    pub own: OwnService,
+    pub attachment: Option<AttachConfig>,
+}
+
+/// Identities the read-only route validator compares against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachConfig {
+    pub cache_host: DnsName,
+    pub source_labels: BTreeMap<String, String>,
+}
+
+/// Parses process arguments, environment and the optional config file; clap usage errors exit 2 itself.
+pub fn load() -> Result<Startup, ConfigError> {
+    let cli = parse_layered(std::env::args_os().collect())?;
+    if cli.command == Some(Subcommands::Crd) {
+        return Ok(Startup::PrintCrd);
+    }
+    let config = Config::from_cli(cli, |name| std::env::var(name).ok())?;
+    Ok(Startup::Run(Box::new(config)))
+}
+
+/// Applies config-file values beneath CLI and environment: CLI > env > file > profile.
+pub fn parse_layered(argv: Vec<OsString>) -> Result<Cli, ConfigError> {
+    let matches = Cli::command().get_matches_from(argv.clone());
+    let mut cli =
+        Cli::from_arg_matches(&matches).map_err(|e| invalid("arguments", e.to_string()))?;
+    let Some(path) = cli.config.clone() else {
+        return Ok(cli);
+    };
+    let entries = read_config_file(&path)?;
+    let mut layered = argv;
+    for (id, values) in entries {
+        if !file_applies(matches.value_source(&id)) {
+            continue;
+        }
+        layered.extend(
+            values
+                .into_iter()
+                .map(|v| OsString::from(format!("--{}={v}", id.replace('_', "-")))),
+        );
+    }
+    let matches = Cli::command()
+        .try_get_matches_from(layered)
+        .map_err(|e| file_error(&path, e.render().to_string()))?;
+    cli = Cli::from_arg_matches(&matches).map_err(|e| file_error(&path, e.to_string()))?;
+    Ok(cli)
+}
+
+/// File values fill only settings neither the command line nor the environment chose.
+fn file_applies(source: Option<ValueSource>) -> bool {
+    matches!(source, None | Some(ValueSource::DefaultValue))
+}
+
+/// Reads `apiVersion`/`kind` plus camelCase flag names into clap ids and string values.
+fn read_config_file(path: &Path) -> Result<Vec<(String, Vec<String>)>, ConfigError> {
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_CONFIG_BYTES + 1).read_to_string(&mut text))
+        .map_err(|e| file_error(path, format!("unreadable: {e}")))?;
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(file_error(path, "exceeds 1MiB"));
+    }
+    let mut doc: BTreeMap<String, Value> =
+        serde_norway::from_str(&text).map_err(|e| file_error(path, e.to_string()))?;
+    expect_header(path, &mut doc, "apiVersion", CONFIG_API_VERSION)?;
+    expect_header(path, &mut doc, "kind", CONFIG_KIND)?;
+    let known: Vec<String> = Cli::command()
+        .get_arguments()
+        .map(|a| a.get_id().to_string())
+        .filter(|id| !matches!(id.as_str(), "config" | "help" | "version"))
+        .collect();
+    doc.into_iter()
+        .map(|(key, value)| {
+            let id = snake_case(&key);
+            if !known.contains(&id) {
+                return Err(file_error(path, format!("unknown field {key:?}")));
+            }
+            Ok((
+                id,
+                scalars(&value).map_err(|why| file_error(path, format!("{key}: {why}")))?,
+            ))
+        })
+        .collect()
+}
+
+fn expect_header(
+    path: &Path,
+    doc: &mut BTreeMap<String, Value>,
+    key: &str,
+    want: &str,
+) -> Result<(), ConfigError> {
+    match doc.remove(key) {
+        Some(Value::String(got)) if got == want => Ok(()),
+        _ => Err(file_error(path, format!("{key} must be {want:?}"))),
+    }
+}
+
+fn snake_case(key: &str) -> String {
+    key.chars()
+        .flat_map(|c| {
+            let lower = c.to_ascii_lowercase();
+            let sep = c.is_ascii_uppercase().then_some('_');
+            sep.into_iter().chain(std::iter::once(lower))
+        })
+        .collect()
+}
+
+fn scalars(value: &Value) -> Result<Vec<String>, String> {
+    match value {
+        Value::Sequence(items) => items.iter().map(scalar).collect(),
+        other => scalar(other).map(|v| vec![v]),
+    }
+}
+
+fn scalar(value: &Value) -> Result<String, String> {
+    match value {
+        Value::String(s) => Ok(s.clone()),
+        Value::Bool(b) => Ok(b.to_string()),
+        Value::Number(n) => Ok(n.to_string()),
+        _ => Err("must be a string, number, boolean or a list of them".into()),
+    }
 }
 
 impl Config {
@@ -333,6 +507,13 @@ impl Config {
             None => TemplateSource::Embedded(cli.profile),
         };
         let backend_authority = backend_authority(&backend)?;
+        if cli.cache_policies && cli.template.is_some() {
+            return Err(invalid(
+                "--cache-policies",
+                "conflicts with --template; a raw template owns the whole policy",
+            ));
+        }
+        let policies = policy_config(&cli, &backend, &namespace)?;
         let signaller = signal_config(&cli, canonical_host.clone())?;
         Ok(Self {
             profile: cli.profile,
@@ -367,9 +548,86 @@ impl Config {
             } else {
                 cli.max_object_size
             },
+            policies,
             log_level: cli.log_level,
         })
     }
+}
+
+fn policy_config(
+    cli: &Cli,
+    backend: &BackendSource,
+    namespace: &str,
+) -> Result<Option<PolicyConfig>, ConfigError> {
+    let validate = cli.validate_attachment.unwrap_or(cli.cache_policies);
+    if !cli.cache_policies {
+        if validate {
+            return Err(invalid("--validate-attachment", "needs --cache-policies"));
+        }
+        return Ok(None);
+    }
+    let own = own_service(cli, backend)?;
+    let attachment = validate.then(|| attach_config(cli)).transpose()?;
+    Ok(Some(PolicyConfig {
+        namespace: namespace.to_owned(),
+        own,
+        attachment,
+    }))
+}
+
+fn own_service(cli: &Cli, backend: &BackendSource) -> Result<OwnService, ConfigError> {
+    let (derived, port_name, port_number) = match backend {
+        BackendSource::Watch(role) => (
+            Some(role.service.clone()),
+            Some(role.port_name.clone()),
+            None,
+        ),
+        BackendSource::Static { host, port } => {
+            let first = host.as_str().split('.').next().map(str::to_owned);
+            (first, None, Some(*port))
+        }
+    };
+    let name = cli
+        .policy_service
+        .clone()
+        .or(derived)
+        .ok_or_else(|| invalid("--policy-service", "is required"))?;
+    Ok(OwnService {
+        name: kube_name("--policy-service", &name)?,
+        port_name,
+        port_number,
+    })
+}
+
+fn attach_config(cli: &Cli) -> Result<AttachConfig, ConfigError> {
+    let cache_host: DnsName = cli
+        .frontend_service_host
+        .as_deref()
+        .ok_or_else(|| invalid("--frontend-service-host", "is required"))?
+        .parse()?;
+    let mut source_labels = BTreeMap::new();
+    for item in &cli.cache_source_labels {
+        let (key, value) = item
+            .split_once('=')
+            .filter(|(k, _)| !k.is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    "--cache-source-labels",
+                    format!("{item:?} is not key=value"),
+                )
+            })?;
+        source_labels.insert(key.to_owned(), value.to_owned());
+    }
+    if source_labels.is_empty() {
+        return Err(invalid(
+            "--cache-source-labels",
+            "is required with --validate-attachment",
+        ));
+    }
+    Ok(AttachConfig {
+        cache_host,
+        source_labels,
+    })
 }
 
 fn backend_authority(backend: &BackendSource) -> Result<Authority, ConfigError> {
@@ -805,6 +1063,150 @@ mod tests {
             args.push(&flag);
             assert!(parse(&args).is_ok(), "{listen}");
         }
+    }
+
+    fn layered(file: &str, args: &[&str]) -> Result<Cli, ConfigError> {
+        let dir = crate::testutil::temp_dir("config-file");
+        let path = dir.join("stalewise.yaml");
+        std::fs::write(&path, file).unwrap();
+        let flag = format!("--config={}", path.display());
+        let mut argv: Vec<OsString> = vec!["stalewise".into(), flag.into()];
+        argv.extend(args.iter().map(OsString::from));
+        parse_layered(argv)
+    }
+
+    const FILE: &str = "apiVersion: stalewise.dev/v1alpha1
+kind: Config
+namespace: apps
+frontendService: cache-peers
+frontendServiceHost: cache.apps.svc
+backendService: catalog
+maxVcls: 3
+purgeAcl: [10.0.0.0/8, \"::1\"]
+signaller: false
+";
+
+    #[test]
+    fn config_file_fills_flags_and_the_command_line_wins() {
+        let cli = layered(FILE, &["--max-vcls=7"]).unwrap();
+        assert_eq!(cli.max_vcls, 7, "CLI beats the file");
+        assert_eq!(cli.purge_acl, ["10.0.0.0/8", "::1"]);
+        let cfg = Config::from_cli(cli, |_| None).unwrap();
+        assert_eq!(cfg.frontend.namespace, "apps");
+        assert!(matches!(cfg.backend, BackendSource::Watch(ref r) if r.service == "catalog"));
+        let defaults = layered(FILE, &[]).unwrap();
+        assert_eq!(defaults.max_vcls, 3, "the file beats built-in defaults");
+    }
+
+    #[test]
+    fn config_file_sets_the_peer_authority() {
+        let file = format!("{FILE}peerAuthority: cache-peers.apps.svc.cluster.local:8080\n");
+        let cli = layered(&file, &[]).unwrap();
+        assert_eq!(
+            cli.peer_authority.as_deref(),
+            Some("cache-peers.apps.svc.cluster.local:8080")
+        );
+    }
+
+    #[test]
+    fn only_defaults_yield_to_the_file() {
+        assert!(file_applies(None));
+        assert!(file_applies(Some(ValueSource::DefaultValue)));
+        assert!(!file_applies(Some(ValueSource::EnvVariable)));
+        assert!(!file_applies(Some(ValueSource::CommandLine)));
+    }
+
+    #[test]
+    fn config_file_errors_name_the_problem() {
+        for (file, needle) in [
+            ("kind: Config\nnamespace: a\n", "apiVersion"),
+            ("apiVersion: stalewise.dev/v1alpha1\nkind: Other\n", "kind"),
+            (
+                "apiVersion: stalewise.dev/v1alpha1\nkind: Config\nnameSpace: a\n",
+                "unknown field \"nameSpace\"",
+            ),
+            (
+                "apiVersion: stalewise.dev/v1alpha1\nkind: Config\npurgeAcl: {a: b}\n",
+                "purgeAcl:",
+            ),
+            (
+                "apiVersion: stalewise.dev/v1alpha1\nkind: Config\nmaxVcls: many\n",
+                "max-vcls",
+            ),
+            (
+                "apiVersion: stalewise.dev/v1alpha1\nkind: Config\nconfig: x\n",
+                "unknown field",
+            ),
+            (": : :", "config file"),
+        ] {
+            let err = layered(file, &[]).unwrap_err().to_string();
+            assert!(err.contains(needle), "{err} lacks {needle}");
+        }
+    }
+
+    #[test]
+    fn crd_subcommand_needs_no_other_flags() {
+        let cli = parse_layered(vec!["stalewise".into(), "crd".into()]).unwrap();
+        assert_eq!(cli.command, Some(Subcommands::Crd));
+    }
+
+    #[test]
+    fn cache_policies_derive_the_service_and_need_labels_for_attachment() {
+        let mut args = BASE.to_vec();
+        args.push("--cache-policies");
+        assert!(
+            parse(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("--cache-source-labels")
+        );
+        args.push(
+            "--cache-source-labels=app.kubernetes.io/name=stalewise,app.kubernetes.io/instance=c",
+        );
+        let policies = parse(&args).unwrap().policies.unwrap();
+        assert_eq!(policies.own.name, "catalog");
+        assert_eq!(policies.own.port_name.as_deref(), Some("http"));
+        assert_eq!(policies.attachment.unwrap().source_labels.len(), 2);
+        let mut off = BASE.to_vec();
+        off.extend(["--cache-policies", "--validate-attachment=false"]);
+        assert!(parse(&off).unwrap().policies.unwrap().attachment.is_none());
+    }
+
+    #[test]
+    fn cache_policies_reject_raw_templates_and_orphan_validation() {
+        let mut args = BASE.to_vec();
+        args.extend([
+            "--cache-policies",
+            "--validate-attachment=false",
+            "--template=/t.vcl",
+        ]);
+        assert!(
+            parse(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("raw template")
+        );
+        let mut args = BASE.to_vec();
+        args.push("--validate-attachment");
+        assert!(parse(&args).is_err());
+    }
+
+    #[test]
+    fn static_origin_policy_service_is_the_first_host_label() {
+        let args = [
+            "--profile=mesh",
+            "--canonical-host=catalog.apps.svc.cluster.local",
+            "--frontend-service=peers",
+            "--frontend-service-host=catalog-cache.apps.svc.cluster.local",
+            "--backend-host=catalog.apps.svc.cluster.local",
+            "--cache-policies",
+            "--validate-attachment=false",
+        ];
+        let own = parse(&args).unwrap().policies.unwrap().own;
+        assert_eq!(
+            (own.name.as_str(), own.port_number),
+            ("catalog", Some(8080))
+        );
     }
 
     #[test]

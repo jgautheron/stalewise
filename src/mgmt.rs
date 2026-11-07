@@ -238,6 +238,7 @@ mod tests {
             name: VclName::generate(1),
             bytes: Arc::from(&b"vcl"[..]),
             since: Instant::now(),
+            policies: Arc::from([]),
         }));
     }
 

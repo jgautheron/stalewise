@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::Profile;
 use crate::endpoint::{Authority, Cidr, Endpoint, Host};
+use crate::policy::RenderPolicy;
 
 /// Template input and rendered output limit.
 pub const MAX_BYTES: usize = 1 << 20;
@@ -124,6 +125,8 @@ pub struct Context {
     pub probe_path: String,
     pub uncacheable_ttl_seconds: u64,
     pub max_object_size: u64,
+    /// Accepted CachePolicies, most specific first; `id` is each one's VCL tag.
+    pub policies: Vec<RenderPolicy>,
 }
 
 impl Context {
@@ -132,6 +135,7 @@ impl Context {
         settings: &RenderSettings,
         frontends: &[Endpoint],
         backends: &[Endpoint],
+        policies: &[RenderPolicy],
     ) -> Result<Self, RenderError> {
         check_unique(frontends)?;
         check_unique(backends)?;
@@ -147,6 +151,7 @@ impl Context {
             probe_path: settings.probe_path.clone(),
             uncacheable_ttl_seconds: settings.uncacheable_ttl.as_secs().max(1),
             max_object_size: settings.max_object_size,
+            policies: policies.to_vec(),
         })
     }
 }
@@ -422,6 +427,7 @@ mod tests {
             &settings(),
             &[],
             &[ip("10.0.0.7", 8080), ip("fd00::1", 8080)],
+            &[],
         )
         .unwrap();
         let out =
@@ -432,7 +438,7 @@ mod tests {
         assert!(out.contains("stalewise_origin.add_backend(ip_fd00__1_8080_v6);"));
         assert!(out.contains("\"10.0.0.0\"/8;"));
         assert!(out.contains("set beresp.ttl = 30s;"));
-        assert!(out.contains("> 10485760)"));
+        assert!(out.contains("std.integer(beresp.http.X-Stalewise-Max, 10485760)"));
         assert!(out.contains("set req.http.Host = \"catalog.apps.svc.cluster.local\";"));
     }
 
@@ -443,7 +449,7 @@ mod tests {
         with.peer_purge = true;
         let peers = [ip("10.1.2.3", 8080), ip("fd00::9", 8080)];
         let render_acl = |s: &RenderSettings| {
-            let ctx = Context::new(s, &peers, &[ip("10.0.0.7", 8080)]).unwrap();
+            let ctx = Context::new(s, &peers, &[ip("10.0.0.7", 8080)], &[]).unwrap();
             String::from_utf8(render(&Template::embedded(Profile::Generic).source, &ctx).unwrap())
                 .unwrap()
         };
@@ -460,7 +466,7 @@ mod tests {
 
     #[test]
     fn generic_template_without_backends_uses_none_backend() {
-        let ctx = Context::new(&settings(), &[], &[]).unwrap();
+        let ctx = Context::new(&settings(), &[], &[], &[]).unwrap();
         let out =
             String::from_utf8(render(&Template::embedded(Profile::Generic).source, &ctx).unwrap())
                 .unwrap();
@@ -474,26 +480,108 @@ mod tests {
             Host::Dns("catalog.apps.svc.cluster.local".parse().unwrap()),
             8080,
         );
-        let ctx = Context::new(&settings(), &[], &[dns]).unwrap();
+        let ctx = Context::new(&settings(), &[], &[dns], &[]).unwrap();
         let out =
             String::from_utf8(render(&Template::embedded(Profile::Mesh).source, &ctx).unwrap())
                 .unwrap();
         assert!(out.contains("set bereq.http.Host = \"catalog.apps.svc.cluster.local:8080\";"));
         assert!(out.contains(".host = \"catalog.apps.svc.cluster.local\";"));
-        let empty = Context::new(&settings(), &[], &[]).unwrap();
+        let empty = Context::new(&settings(), &[], &[], &[]).unwrap();
         assert!(render(&Template::embedded(Profile::Mesh).source, &empty).is_err());
+    }
+
+    fn policies() -> Vec<RenderPolicy> {
+        let own = crate::policy::OwnService {
+            name: "catalog".into(),
+            port_name: None,
+            port_number: None,
+        };
+        let candidates: Vec<crate::policy::Candidate> = [
+            ("root", "serviceRef: {name: catalog}\npathPrefix: /\noverrides: {ttlSeconds: 0}"),
+            ("api", r#"
+serviceRef: {name: catalog}
+pathPrefix: /api/
+overrides:
+  ttlSeconds: 120
+  graceSeconds: 15
+  keepSeconds: 60
+  cacheableMethods: [GET]
+  cacheableStatusCodes: [200, 404]
+  maxObjectBytes: 2048
+  key: {headers: [X-Version], queryAllowList: [page, a.b]}
+  cookies: {mode: stripListed, names: [analytics]}
+bypass:
+  - pathPrefix: /api/account
+  - header: {name: X-Preview, exact: "true"}
+"#),
+            ("plain", "serviceRef: {name: catalog}\npathPrefix: /static\noverrides: {key: {queryAllowList: []}}"),
+        ]
+        .iter()
+        .map(|(name, yaml)| crate::policy::Candidate {
+            name: (*name).into(),
+            generation: 1,
+            outcome: crate::policy::validate(name, 1, &serde_norway::from_str(yaml).unwrap(), &own),
+        })
+        .collect();
+        crate::policy::resolve(&candidates, &BTreeMap::new()).policies
+    }
+
+    fn render_with(policies: &[RenderPolicy]) -> String {
+        let ctx = Context::new(&settings(), &[], &[ip("10.0.0.7", 8080)], policies).unwrap();
+        String::from_utf8(render(&Template::embedded(Profile::Generic).source, &ctx).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn policies_render_most_specific_match_first_on_both_sides() {
+        let out = render_with(&policies());
+        let api = out.find(r#"if (req.url ~ "^/api(/|\?|$)")"#).unwrap();
+        let root = out.find(r#"} elsif (req.url ~ "^/")"#).unwrap();
+        assert!(api < root, "longest prefix is tested first");
+        assert!(out.contains(r#"if (bereq.url ~ "^/api(/|\?|$)") {"#));
+        assert!(out.contains(r#"set beresp.http.X-Stalewise-Max = "2048";"#));
+    }
+
+    #[test]
+    fn policy_overrides_render_beside_header_defaults() {
+        let out = render_with(&policies());
+        for fragment in [
+            r#"set beresp.http.X-Stalewise-Fresh = "120";"#,
+            r#"set beresp.http.X-Stalewise-Fresh = "0";"#,
+            r#"set beresp.http.X-Stalewise-Swr = "15";"#,
+            "set beresp.keep = 60s;",
+            r#"if (req.url ~ "^/api/account(/|\?|$)") {"#,
+            r#"if (req.http.X-Preview == "true") {"#,
+            r#"if (req.method != "GET") {"#,
+            r#"(?:page|a\.b)(?:=|&|$)"#,
+            r#"(^|;)\s*(analytics)=[^;]*"#,
+            "hash_data(req.http.X-Version);",
+            r#"beresp.http.X-Stalewise-Policy != "2" &&"#,
+            "if (beresp.status != 200 &&\n            beresp.status != 404) {",
+            r#"set req.http.X-Stalewise-Key-Url = regsub(req.url, "\?.*$", "");"#,
+        ] {
+            assert!(out.contains(fragment), "missing {fragment}");
+        }
+    }
+
+    #[test]
+    fn no_policies_renders_header_only_behaviour() {
+        let out = render_with(&[]);
+        assert!(!out.contains("X-Stalewise-Policy = "));
+        assert!(!out.contains("X-Stalewise-Policy =="));
+        assert!(out.contains("std.integer(beresp.http.X-Stalewise-Max, 10485760)"));
     }
 
     #[test]
     fn strict_undefined_fails_rendering() {
-        let ctx = Context::new(&settings(), &[], &[]).unwrap();
+        let ctx = Context::new(&settings(), &[], &[], &[]).unwrap();
         assert!(render("{{ nope }}", &ctx).is_err());
         assert!(render("{{ env.MISSING }}", &ctx).is_err());
     }
 
     #[test]
     fn vcl_str_escapes_quotes_and_rejects_controls() {
-        let ctx = Context::new(&settings(), &[], &[]).unwrap();
+        let ctx = Context::new(&settings(), &[], &[], &[]).unwrap();
         let out = render("{{ env.SHARD | vcl_str }}", &ctx).unwrap();
         assert_eq!(out, b"{\"a\"b\"}");
         assert_eq!(vcl_str("plain".into()).unwrap(), "\"plain\"");
@@ -506,7 +594,7 @@ mod tests {
         let a = Endpoint::new(Host::Dns("a-b.svc".parse().unwrap()), 80);
         let b = Endpoint::new(Host::Dns("a.b.svc".parse().unwrap()), 80);
         assert!(matches!(
-            Context::new(&settings(), &[], &[a, b]),
+            Context::new(&settings(), &[], &[a, b], &[]),
             Err(RenderError::Collision(_))
         ));
     }
@@ -526,7 +614,7 @@ mod tests {
             Err(RenderError::Encoding)
         ));
         assert!(Template::parse(b"{% if %}").is_err());
-        let ctx = Context::new(&settings(), &[], &[]).unwrap();
+        let ctx = Context::new(&settings(), &[], &[], &[]).unwrap();
         assert!(matches!(
             render("{% for i in range(2000000) %}x{% endfor %}", &ctx),
             Err(RenderError::TooLarge | RenderError::Template(_))

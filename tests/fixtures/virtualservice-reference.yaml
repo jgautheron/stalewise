@@ -1,0 +1,65 @@
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: catalog
+  namespace: apps
+spec:
+  hosts:
+    - catalog.apps.svc.cluster.local
+  gateways:
+    - mesh
+  http:
+    - name: origin-from-cache
+      match:
+        - sourceNamespace: apps
+          sourceLabels:
+            app.kubernetes.io/name: stalewise
+            app.kubernetes.io/instance: catalog-cache
+      retries:
+        attempts: 2
+        perTryTimeout: 2s
+        retryOn: connect-failure,reset,5xx
+      route:
+        - destination:
+            host: catalog.apps.svc.cluster.local
+            port:
+              number: 8080
+          weight: 100
+    - name: explicit-cache-bypass
+      match:
+        - headers:
+            x-stalewise-bypass:
+              exact: "true"
+      retries:
+        attempts: 2
+        perTryTimeout: 2s
+        retryOn: connect-failure,reset,5xx
+      route:
+        - destination:
+            host: catalog.apps.svc.cluster.local
+            port:
+              number: 8080
+          weight: 100
+    - name: cache-read-methods
+      match:
+        - method:
+            exact: GET
+        - method:
+            exact: HEAD
+      route:
+        - destination:
+            host: catalog-cache.apps.svc.cluster.local
+            port:
+              number: 8080
+          weight: 100
+    - name: existing-application-route
+      retries:
+        attempts: 2
+        perTryTimeout: 2s
+        retryOn: connect-failure,reset,5xx
+      route:
+        - destination:
+            host: catalog.apps.svc.cluster.local
+            port:
+              number: 8080
+          weight: 100

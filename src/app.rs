@@ -114,19 +114,46 @@ struct Shared {
     root: CancellationToken,
 }
 
-fn template_input(config: &Config, root: &CancellationToken) -> watch::Receiver<Option<Template>> {
+/// Tasks that return only on `root` cancellation; any earlier exit, including a panic, is fatal.
+#[derive(Default)]
+struct Background(Vec<(&'static str, JoinHandle<()>)>);
+
+impl Background {
+    fn spawn<F>(&mut self, name: &'static str, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.0.push((name, tokio::spawn(task)));
+    }
+
+    /// Resolves when the first task ends, naming it; pending forever when there are none.
+    async fn first_exit(&mut self) -> String {
+        if self.0.is_empty() {
+            return std::future::pending().await;
+        }
+        let handles = self.0.iter_mut().map(|(_, handle)| handle);
+        let (result, index, _) = futures_util::future::select_all(handles).await;
+        let name = self.0.get(index).map_or("task", |(name, _)| *name);
+        match result {
+            Ok(()) => format!("{name} stopped"),
+            Err(err) => format!("{name} failed: {err}"),
+        }
+    }
+}
+
+fn template_input(
+    config: &Config,
+    root: &CancellationToken,
+    tasks: &mut Background,
+) -> watch::Receiver<Option<Template>> {
     let (tx, rx) = watch::channel(None);
     match &config.template {
         TemplateSource::Embedded(profile) => {
             tx.send_replace(Some(Template::embedded(*profile)));
         }
         TemplateSource::File(path) => {
-            tokio::spawn(render::poll(
-                path.clone(),
-                config.template_poll,
-                tx,
-                root.clone(),
-            ));
+            let poll = render::poll(path.clone(), config.template_poll, tx, root.clone());
+            tasks.spawn("template poller", poll);
         }
     }
     rx
@@ -135,18 +162,20 @@ fn template_input(config: &Config, root: &CancellationToken) -> watch::Receiver<
 async fn discovery_inputs(
     config: &Config,
     shared: &Shared,
+    tasks: &mut Background,
 ) -> Result<(watch::Receiver<Option<Discovery>>, BackendInput), StartupError> {
     let client = kube::Client::try_default().await;
     let (front_tx, front_rx) = watch::channel(None);
-    let spawn_watch = |client: kube::Client, role, tx| {
-        tokio::spawn(discovery::watch(
+    let mut spawn_watch = |client: kube::Client, role, tx| {
+        let watch = discovery::watch(
             client,
             role,
             tx,
             Arc::clone(&shared.metrics),
             shared.health.clone(),
             shared.root.clone(),
-        ));
+        );
+        tasks.spawn("EndpointSlice watcher", watch);
     };
     match &client {
         Ok(client) => spawn_watch(client.clone(), config.frontend.clone(), front_tx),
@@ -209,8 +238,9 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         root.clone(),
     ));
 
-    let template = template_input(&config, &root);
-    let (frontends, backends) = discovery_inputs(&config, &shared).await?;
+    let mut tasks = Background::default();
+    let template = template_input(&config, &root, &mut tasks);
+    let (frontends, backends) = discovery_inputs(&config, &shared, &mut tasks).await?;
     let admin = AdminConfig {
         addr: config.admin_listen,
         secret_file,
@@ -269,7 +299,7 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         process_tx,
         child_stop.clone(),
     ));
-    tokio::spawn(reload::run(
+    let reload = reload::run(
         reload_config,
         inputs,
         initial,
@@ -277,13 +307,15 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         active_tx,
         shared.health.clone(),
         root.clone(),
-    ));
-    tokio::spawn(mgmt::probe(
+    );
+    tasks.spawn("reloader", reload);
+    let probe = mgmt::probe(
         mgmt::probe_target(config.listen),
         process_rx,
         probe_tx,
         root.clone(),
-    ));
+    );
+    tasks.spawn("frontend probe", probe);
     let mut signal_task: JoinHandle<Result<(), signaller::SignallerError>> =
         match (config.signaller.clone(), token) {
             (Some(sig), Some(token)) => spawn_signaller(sig, token, frontends, &shared),
@@ -300,6 +332,7 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         }
         result = &mut mgmt_task => Some(format!("management listener stopped: {}", flatten(result))),
         result = &mut signal_task => Some(format!("signaller stopped: {}", flatten(result))),
+        reason = tasks.first_exit() => Some(reason),
     };
     root.cancel();
     if let Some(reason) = failure {
@@ -352,5 +385,19 @@ fn describe_child(
         Ok(Ok(status)) => format!("varnishd exited: {status}"),
         Ok(Err(err)) => err.to_string(),
         Err(err) => format!("supervisor task failed: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn background_reports_a_panicked_task_by_name() {
+        let mut tasks = Background::default();
+        tasks.spawn("idle", std::future::pending());
+        tasks.spawn("reloader", async { panic!("boom") });
+        let reason = tasks.first_exit().await;
+        assert!(reason.starts_with("reloader failed"), "{reason}");
     }
 }

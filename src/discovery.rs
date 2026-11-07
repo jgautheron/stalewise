@@ -153,7 +153,8 @@ impl Backoff {
     }
 }
 
-/// Watches one Service's EndpointSlices until `stop`; errors retain the last snapshot.
+/// Watches one Service's EndpointSlices until `stop`; errors retain the last snapshot and a
+/// finished stream is reopened, so the task returns only on `stop`.
 pub async fn watch(
     client: kube::Client,
     role: RoleConfig,
@@ -167,7 +168,7 @@ pub async fn watch(
     let config = watcher::Config::default()
         .labels(&selector)
         .timeout(WATCH_TIMEOUT_SECS);
-    let mut stream = watcher::watcher(api, config).boxed();
+    let mut stream = watcher::watcher(api.clone(), config.clone()).boxed();
     let mut store = SliceStore::default();
     let mut backoff = Backoff::default();
     let labels = Metrics::role(role.role);
@@ -192,7 +193,17 @@ pub async fn watch(
                     () = tokio::time::sleep(backoff.next_delay()) => {}
                 }
             }
-            None => return,
+            None => {
+                tracing::warn!(
+                    role = role.role.as_str(),
+                    "EndpointSlice watch ended; restarting"
+                );
+                tokio::select! {
+                    () = stop.cancelled() => return,
+                    () = tokio::time::sleep(backoff.next_delay()) => {}
+                }
+                stream = watcher::watcher(api.clone(), config.clone()).boxed();
+            }
         }
     }
 }

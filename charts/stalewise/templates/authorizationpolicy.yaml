@@ -19,4 +19,17 @@ spec:
         - operation:
             methods: ["PURGE", "BAN"]
             ports: [{{ .Values.ports.http | quote }}]
+    {{- if .Values.shard.enabled }}
+    # Shard forwards arrive from the sidecar address, so only this cache's identity may send hop headers.
+    - from:
+        - source:
+            notPrincipals:
+              - {{ printf "%s/ns/%s/sa/%s" .Values.mesh.trustDomain .Release.Namespace (include "stalewise.serviceAccountName" .) | quote }}
+      to:
+        - operation:
+            ports: [{{ .Values.ports.http | quote }}]
+      when:
+        - key: request.headers[x-stalewise-shard-hop]
+          values: ["*"]
+    {{- end }}
 {{- end }}

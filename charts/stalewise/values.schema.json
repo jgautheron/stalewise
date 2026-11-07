@@ -209,6 +209,31 @@
         },
         "peerAuthority": {
           "type": "string"
+        },
+        "invalidationHistory": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "shard": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "localTtl": {
+          "type": "string",
+          "pattern": "^([0-9]+ms|[0-9]+s|0m)$"
+        },
+        "membershipDebounce": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s)$"
+        },
+        "peerTimeout": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m)$"
         }
       }
     },

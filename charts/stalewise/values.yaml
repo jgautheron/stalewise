@@ -55,8 +55,20 @@ signaller:
     key: token
   methods: [PURGE, BAN]
   deliveryDeadline: 10s
-  # Host header for peer deliveries; empty means the headless peers Service FQDN and port.
+  # Host header for peer deliveries and shard forwards; empty means the headless peers Service FQDN and port.
   peerAuthority: ""
+  # Invalidation status records kept for GET /invalidations/<id>.
+  invalidationHistory: 1024
+
+# Route each object to one owner replica through the VCL shard director; opt-in.
+shard:
+  enabled: false
+  # Freshness cap for copies non-owners keep, at most 30s; 0s stores no bodies off-owner.
+  localTtl: 0s
+  # How long a peer membership change must persist before the ring changes (100ms-30s).
+  membershipDebounce: 5s
+  # Connect, first-byte and between-bytes timeout for forwarded requests.
+  peerTimeout: 2s
 
 # CachePolicy resources (stalewise.dev/v1alpha1); incompatible with a raw template.
 cachePolicies:

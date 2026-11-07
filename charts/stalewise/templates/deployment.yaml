@@ -65,6 +65,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIPs
+            - name: STALEWISE_POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: STALEWISE_MEMBERSHIP_DEBOUNCE
+              value: {{ .Values.shard.membershipDebounce | quote }}
             - name: STALEWISE_FRONTEND_SERVICE
               value: {{ printf "%s-peers" $fullname | quote }}
             - name: STALEWISE_FRONTEND_SERVICE_HOST
@@ -149,8 +155,20 @@ spec:
               value: {{ join "," .Values.signaller.methods | quote }}
             - name: STALEWISE_DELIVERY_DEADLINE
               value: {{ .Values.signaller.deliveryDeadline | quote }}
+            - name: STALEWISE_INVALIDATION_HISTORY
+              value: {{ .Values.signaller.invalidationHistory | int64 | toString | quote }}
+            {{- end }}
+            {{- if .Values.shard.enabled }}
+            - name: STALEWISE_SHARD
+              value: "true"
+            - name: STALEWISE_SHARD_LOCAL_TTL
+              value: {{ .Values.shard.localTtl | quote }}
+            - name: STALEWISE_PEER_TIMEOUT
+              value: {{ .Values.shard.peerTimeout | quote }}
+            {{- end }}
+            {{- if or .Values.signaller.enabled .Values.shard.enabled }}
             - name: STALEWISE_PEER_AUTHORITY
-              value: {{ .Values.signaller.peerAuthority | default (printf "%s-peers.%s.svc.cluster.local:%v" $fullname .Release.Namespace .Values.ports.http) | quote }}
+              value: {{ include "stalewise.peerAuthority" . | quote }}
             {{- end }}
           ports:
             - name: http

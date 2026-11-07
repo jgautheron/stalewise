@@ -35,4 +35,17 @@ helm template catalog-cache "$chart" --namespace apps --set backend.service=cata
 expect 'name: catalog-cache-stalewise'
 if grep -qF 'cachepolicies' "$out"; then fail "policy RBAC rendered while cachePolicies is disabled"; fi
 validate "$out"
+helm template catalog-cache "$chart" --namespace apps -f "$chart/values-mesh.yaml" \
+  --set shard.enabled=true --set shard.localTtl=5s >"$out"
+expect 'name: STALEWISE_SHARD'
+expect 'value: "5s"'
+expect 'fieldPath: metadata.name'
+expect 'value: "catalog-cache-peers.apps.svc.cluster.local:8080"'
+expect 'key: request.headers[x-stalewise-shard-hop]'
+validate "$out"
+
+if helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog \
+  --set shard.enabled=true --set mesh.sidecar=true >/dev/null 2>&1; then
+  fail "sharding behind a sidecar rendered without the AuthorizationPolicy"
+fi
 echo "chart-check: ok"

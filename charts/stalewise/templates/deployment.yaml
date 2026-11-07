@@ -102,11 +102,11 @@ spec:
             - name: STALEWISE_STORAGE
               value: {{ .Values.storage | quote }}
             - name: STALEWISE_MAX_VCLS
-              value: {{ .Values.maxVcls | quote }}
+              value: {{ .Values.maxVcls | int64 | toString | quote }}
             - name: STALEWISE_UNCACHEABLE_TTL
               value: {{ .Values.uncacheableTtl | quote }}
             - name: STALEWISE_MAX_OBJECT_SIZE
-              value: {{ .Values.maxObjectSize | quote }}
+              value: {{ .Values.maxObjectSize | int64 | toString | quote }}
             - name: STALEWISE_PURGE_ACL
               value: {{ include "stalewise.purgeAcl" . | quote }}
             - name: STALEWISE_LOG_LEVEL

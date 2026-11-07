@@ -28,6 +28,8 @@ const OPENMETRICS: &str = "application/openmetrics-text; version=1.0.0; charset=
 #[derive(Debug, Clone)]
 pub struct ManagementConfig {
     pub listen: SocketAddr,
+    /// Kubelet probes only; its own connection slots keep scrapers from starving liveness.
+    pub probe_listen: SocketAddr,
 }
 
 /// Everything readiness and metrics observe.
@@ -116,35 +118,61 @@ async fn probe_once(target: SocketAddr) -> bool {
     )
 }
 
-/// Serves /healthz, /readyz and /metrics until `stop`; bind failure is fatal.
+/// Which endpoints a listener exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Management,
+    Probe,
+}
+
+/// Serves /healthz, /readyz and /metrics on the management port and /healthz, /readyz on the
+/// probe port until `stop`; bind failure is fatal.
 pub async fn serve(
     config: ManagementConfig,
     inputs: StatusInputs,
     metrics: Arc<Metrics>,
     stop: CancellationToken,
 ) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    tracing::info!(addr = %config.listen, "management listening");
+    let management = tokio::net::TcpListener::bind(config.listen).await?;
+    let probes = tokio::net::TcpListener::bind(config.probe_listen).await?;
+    tracing::info!(addr = %config.listen, probe_addr = %config.probe_listen, "management listening");
     let limits = Limits {
         header_timeout: Duration::from_secs(5),
         connection_timeout: Duration::from_secs(15),
     };
-    let handler = move |req: Request<Incoming>| {
-        let response = respond(&req, &inputs, &metrics);
-        async move { response }
+    let handler = |surface: Surface| {
+        let inputs = inputs.clone();
+        let metrics = Arc::clone(&metrics);
+        move |req: Request<Incoming>| {
+            let response = respond(surface, &req, &inputs, &metrics);
+            async move { response }
+        }
     };
-    http::serve(listener, limits, handler, stop).await;
+    tokio::join!(
+        http::serve(
+            management,
+            limits,
+            handler(Surface::Management),
+            stop.clone()
+        ),
+        http::serve(probes, limits, handler(Surface::Probe), stop),
+    );
     Ok(())
 }
 
-fn respond(req: &Request<Incoming>, inputs: &StatusInputs, metrics: &Metrics) -> Response<Body> {
+fn respond(
+    surface: Surface,
+    req: &Request<Incoming>,
+    inputs: &StatusInputs,
+    metrics: &Metrics,
+) -> Response<Body> {
     if req.method() != Method::GET {
         return http::text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
     }
-    match req.uri().path() {
-        "/healthz" => healthz(inputs),
-        "/readyz" => readyz(inputs, metrics),
-        "/metrics" => scrape(inputs, metrics),
+    match (surface, req.uri().path()) {
+        (_, "/healthz") => healthz(inputs),
+        (_, "/readyz") => readyz(inputs, metrics),
+        (Surface::Management, "/metrics") => scrape(inputs, metrics),
         _ => http::text(StatusCode::NOT_FOUND, "not found\n"),
     }
 }
@@ -318,7 +346,10 @@ mod tests {
         drop(probe);
         let stop = CancellationToken::new();
         let task = tokio::spawn(serve(
-            ManagementConfig { listen: addr },
+            ManagementConfig {
+                listen: addr,
+                probe_listen: free_port(),
+            },
             f.inputs.clone(),
             metrics,
             stop.clone(),
@@ -346,6 +377,53 @@ mod tests {
         f.process.send_replace(ProcessState::Exited);
         assert_eq!(get("/healthz").await, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(get("/readyz").await, StatusCode::SERVICE_UNAVAILABLE);
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    fn free_port() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    }
+
+    async fn healthz_status(addr: SocketAddr) -> Option<StatusCode> {
+        let mut req = Request::new(Full::new(Bytes::new()));
+        *req.uri_mut() = hyper::Uri::from_static("/healthz");
+        req.headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("x"));
+        http::send(addr, req, Duration::from_millis(500)).await.ok()
+    }
+
+    #[tokio::test]
+    async fn probe_answers_while_management_is_saturated() {
+        let f = fixture();
+        activate(&f);
+        let metrics = Arc::clone(f.inputs.health.metrics());
+        let management = free_port();
+        let probe = free_port();
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(serve(
+            ManagementConfig {
+                listen: management,
+                probe_listen: probe,
+            },
+            f.inputs.clone(),
+            metrics,
+            stop.clone(),
+        ));
+        for _ in 0..100 {
+            if healthz_status(probe).await == Some(StatusCode::OK) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut idle = Vec::new();
+        for _ in 0..128 {
+            idle.push(tokio::net::TcpStream::connect(management).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(healthz_status(probe).await, Some(StatusCode::OK));
+        drop(idle);
         stop.cancel();
         task.await.unwrap().unwrap();
     }

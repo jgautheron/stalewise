@@ -102,6 +102,12 @@ spec:
               value: {{ printf "0.0.0.0:%v" .Values.ports.http | quote }}
             - name: STALEWISE_MANAGEMENT_LISTEN
               value: {{ printf "0.0.0.0:%v" .Values.ports.management | quote }}
+            - name: STALEWISE_PROBE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: STALEWISE_PROBE_LISTEN
+              value: {{ printf "$(STALEWISE_PROBE_IP):%v" .Values.ports.probe | quote }}
             - name: STALEWISE_WORK_DIR
               value: /var/lib/stalewise
             - name: STALEWISE_VARNISH_WORK_DIR
@@ -181,6 +187,9 @@ spec:
             - name: management
               containerPort: {{ .Values.ports.management }}
               protocol: TCP
+            - name: probe
+              containerPort: {{ .Values.ports.probe }}
+              protocol: TCP
             {{- if .Values.signaller.enabled }}
             - name: signaller
               containerPort: {{ .Values.ports.signaller }}
@@ -189,20 +198,20 @@ spec:
           startupProbe:
             httpGet:
               path: /healthz
-              port: management
+              port: probe
             periodSeconds: 2
             failureThreshold: 45
           livenessProbe:
             httpGet:
               path: /healthz
-              port: management
+              port: probe
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /readyz
-              port: management
+              port: probe
             periodSeconds: 5
             timeoutSeconds: 2
             failureThreshold: 2

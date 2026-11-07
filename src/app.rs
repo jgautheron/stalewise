@@ -263,6 +263,7 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
     };
     let management = ManagementConfig {
         listen: config.management_listen,
+        probe_listen: config.probe_listen,
     };
     let mut mgmt_task = tokio::spawn(mgmt::serve(
         management,

@@ -58,4 +58,17 @@ if helm template catalog-cache "$chart" --namespace apps --set backend.service=c
   --set shard.enabled=true --set mesh.sidecar=true >/dev/null 2>&1; then
   fail "sharding behind a sidecar rendered without the AuthorizationPolicy"
 fi
+helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog \
+  --set networkPolicy.enabled=true --set signaller.enabled=true \
+  --set signaller.tokenSecret.name=token >"$out"
+expect 'kind: NetworkPolicy'
+expect 'port: probe'
+expect 'value: "$(STALEWISE_PROBE_IP):9091"'
+policy="$(yq 'select(.kind == "NetworkPolicy") | .spec.ingress' "$out")"
+if grep -qE 'port: (management|signaller|probe)' <<<"$policy"; then fail "empty source lists must admit nobody"; fi
+[[ "$(yq 'select(.kind == "NetworkPolicy") | .spec.ingress | length' "$out")" == 1 ]] || fail "only the peer rule may render"
+if [[ -n "$(yq 'select(.kind == "NetworkPolicy") | .spec.ingress[] | select(has("from") | not)' "$out")" ]]; then
+  fail "an ingress rule without sources admits everyone"
+fi
+validate "$out"
 echo "chart-check: ok"

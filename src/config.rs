@@ -89,6 +89,22 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
     }
 }
 
+/// Parses `ip:port`, also accepting an unbracketed IPv6 address such as `fd00::1:9091`
+/// so a Kubernetes `$(POD_IP):port` expansion works in both families.
+pub fn parse_listen(raw: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = raw.parse() {
+        return Ok(addr);
+    }
+    let (ip, port) = raw
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{raw:?} is not ip:port"))?;
+    let ip: IpAddr = ip.parse().map_err(|_| format!("{raw:?} has no valid IP"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("{raw:?} has no valid port"))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
 /// Raw flags; every flag has an environment equivalent and CLI wins.
 #[derive(Debug, Parser)]
 #[command(
@@ -174,6 +190,9 @@ pub struct Cli {
         default_value = "0.0.0.0:9090"
     )]
     pub management_listen: SocketAddr,
+    /// Liveness and readiness only, with connection slots of its own; `ip:port`, IPv6 may be bare.
+    #[arg(long, env = "STALEWISE_PROBE_LISTEN", value_parser = parse_listen, default_value = "0.0.0.0:9091")]
+    pub probe_listen: SocketAddr,
     #[arg(long, env = "STALEWISE_SIGNALLER", num_args = 0..=1, default_missing_value = "true", default_value = "false", action = ArgAction::Set)]
     pub signaller: bool,
     #[arg(
@@ -373,6 +392,7 @@ pub struct Config {
     pub startup_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub management_listen: SocketAddr,
+    pub probe_listen: SocketAddr,
     pub signaller: Option<SignalConfig>,
     pub shard: Option<ShardConfig>,
     pub membership_debounce: Duration,
@@ -583,6 +603,7 @@ impl Config {
             startup_timeout: positive("--startup-timeout", cli.startup_timeout)?,
             shutdown_timeout: positive("--shutdown-timeout", cli.shutdown_timeout)?,
             management_listen: cli.management_listen,
+            probe_listen: distinct_probe(cli.probe_listen, cli.management_listen)?,
             signaller,
             shard,
             membership_debounce: within(
@@ -927,6 +948,16 @@ fn frontend_listen(addr: SocketAddr) -> Result<SocketAddr, ConfigError> {
             "must be a wildcard or loopback address with a port",
         ))
     }
+}
+
+fn distinct_probe(probe: SocketAddr, management: SocketAddr) -> Result<SocketAddr, ConfigError> {
+    if probe.port() == management.port() {
+        return Err(invalid(
+            "--probe-listen",
+            "must use a port other than --management-listen",
+        ));
+    }
+    Ok(probe)
 }
 
 fn opaque(flag: &'static str, value: String) -> Result<String, ConfigError> {
@@ -1389,6 +1420,22 @@ signaller: false
             (own.name.as_str(), own.port_number),
             ("catalog", Some(8080))
         );
+    }
+
+    #[test]
+    fn probe_listen_accepts_bare_ipv6_and_rejects_the_management_port() {
+        assert_eq!(
+            parse_listen("fd00::1:9091").unwrap(),
+            "[fd00::1]:9091".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_listen("10.0.0.7:9091").unwrap(),
+            "10.0.0.7:9091".parse::<SocketAddr>().unwrap()
+        );
+        assert!(parse_listen("fd00::1").is_err());
+        let mut args = vec!["--probe-listen=0.0.0.0:9090"];
+        args.extend(BASE);
+        assert!(parse(&args).is_err());
     }
 
     #[test]

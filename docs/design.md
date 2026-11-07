@@ -90,6 +90,7 @@ CLI overrides environment, then the `--config` file, then profile defaults. List
 | `--startup-timeout` | `STALEWISE_STARTUP_TIMEOUT` | 60s |
 | `--shutdown-timeout` | `STALEWISE_SHUTDOWN_TIMEOUT` | 30s |
 | `--management-listen` | `STALEWISE_MANAGEMENT_LISTEN` | 0.0.0.0:9090 |
+| `--probe-listen` | `STALEWISE_PROBE_LISTEN` | 0.0.0.0:9091; `/healthz` and `/readyz` only, separate connection slots; bare IPv6 accepted |
 | `--signaller` | `STALEWISE_SIGNALLER` | false |
 | `--signaller-listen` | `STALEWISE_SIGNALLER_LISTEN` | 0.0.0.0:8081 |
 | `--signaller-token-file` | `STALEWISE_SIGNALLER_TOKEN_FILE` | required when enabled |

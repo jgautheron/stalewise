@@ -15,9 +15,11 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 - The image workflow signs the index digest reported by its own `imagetools create`, instead of re-reading the mutable version tag, so a repointed tag can no longer obtain a trusted signature. CI runs actionlint and `scripts/workflow-check.sh`.
 - CachePolicy conflict messages name at most three rivals plus a count, so many same-prefix policies no longer cause quadratic memory use. `--max-cache-policies` (default 256, chart `cachePolicies.maxPolicies`) admits the oldest policies and marks the rest Invalid with reason `TooManyPolicies`.
 - `PURGE` applies the CachePolicy query allow-list and key headers, so it removes objects stored under a normalized key. Before, `PURGE /asset?tracking=x` missed an object stored as `/asset`.
+- Kubelet probes use a dedicated `--probe-listen` listener (default `0.0.0.0:9091`; chart port `probe`, bound on the pod IP) with its own connection slots, so 128 idle management connections can no longer fail liveness.
 
 ### Changed
 
+- **Breaking (chart):** with `networkPolicy.enabled`, an empty `trafficFrom`, `managementFrom` or `signallerFrom` now admits no source on that port instead of every source. Cache pods still reach each other's `http` port.
 - `--log-level` accepts a level or comma-separated `target=level` directives; span and field filters are no longer accepted and fail startup.
 - Log lines and CLI help no longer contain ANSI color codes, and mistyped flags no longer get spelling suggestions.
 - The signaller answers 503 `entropy unavailable` when the OS random source fails instead of panicking.

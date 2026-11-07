@@ -15,6 +15,8 @@ The design is in [docs/design.md](docs/design.md), with decisions in [docs/adr](
   It skips byte-identical renders and keeps the last good VCL when anything fails.
 - The optional signaller accepts authenticated `PURGE` and `BAN` requests and delivers them to every peer through a bounded queue.
 - The management listener serves `/healthz`, `/readyz` and `/metrics`.
+  A separate probe listener (`--probe-listen`, default `0.0.0.0:9091`) serves only `/healthz` and `/readyz` for the kubelet.
+  It has its own connection slots, so clients holding management connections open cannot fail liveness.
 
 Serving fails open and configuration changes fail closed.
 `/readyz` returns 503 only when there is no active VCL or the local synthetic probe fails.
@@ -204,6 +206,12 @@ Upgrade every replica before enabling sharding, and disable it before rolling ba
 
 The chart in [charts/stalewise](charts/stalewise) deploys one cache per application Service.
 It creates traffic, headless peer, and management Services, a namespaced Role for EndpointSlices, probes, a PodDisruptionBudget, and an optional NetworkPolicy.
+Probes target the `probe` port (9091), which the chart binds on the pod IP and exposes through no Service.
+
+With `networkPolicy.enabled`, each source list admits only the peers it names, and an empty list admits nobody on that port.
+Cache pods can always reach each other's `http` port.
+The probe port has no rule, because kubelet traffic comes from the node.
+Earlier charts treated an empty list as "allow every source"; set `trafficFrom`, `managementFrom` and `signallerFrom` explicitly when you upgrade.
 Pods run as uid 1000 with a read-only root filesystem and emptyDir work volumes.
 The default memory limit is 512Mi: `storage` (256m) plus `transientStorage` (64m) plus process overhead.
 Raise `resources.limits.memory` together with either store.

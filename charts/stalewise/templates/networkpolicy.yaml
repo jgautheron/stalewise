@@ -1,4 +1,5 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- /* An empty source list admits nobody; the probe port has no rule because kubelet traffic is node-local. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -14,33 +15,31 @@ spec:
     - ports:
         - port: http
           protocol: TCP
-      {{- with .Values.networkPolicy.trafficFrom }}
-      from:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-    {{- if .Values.networkPolicy.trafficFrom }}
-    - ports:
-        - port: http
-          protocol: TCP
       from:
         - podSelector:
             matchLabels:
               {{- include "stalewise.selectorLabels" . | nindent 14 }}
+    {{- with .Values.networkPolicy.trafficFrom }}
+    - ports:
+        - port: http
+          protocol: TCP
+      from:
+        {{- toYaml . | nindent 8 }}
     {{- end }}
+    {{- with .Values.networkPolicy.managementFrom }}
     - ports:
         - port: management
           protocol: TCP
-      {{- with .Values.networkPolicy.managementFrom }}
       from:
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+    {{- end }}
     {{- if .Values.signaller.enabled }}
+    {{- with .Values.networkPolicy.signallerFrom }}
     - ports:
         - port: signaller
           protocol: TCP
-      {{- with .Values.networkPolicy.signallerFrom }}
       from:
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+    {{- end }}
     {{- end }}
 {{- end }}

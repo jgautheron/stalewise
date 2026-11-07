@@ -31,6 +31,8 @@ ports:
   http: 8080
   signaller: 8081
   management: 9090
+  # Kubelet probes only, bound on the pod IP; not in any Service or NetworkPolicy rule.
+  probe: 9091
 
 storage: malloc,256m
 # Uncacheable and short-lived objects; keep it finite so a slow client cannot exhaust memory.
@@ -127,7 +129,8 @@ podDisruptionBudget:
 
 networkPolicy:
   enabled: false
-  # NetworkPolicyPeer lists; empty means any source in the namespace's cluster.
+  # NetworkPolicyPeer lists; an empty list admits no source on that port.
+  # Cache pods always reach each other's http port; kubelet probes need no rule.
   trafficFrom: []
   managementFrom: []
   signallerFrom: []

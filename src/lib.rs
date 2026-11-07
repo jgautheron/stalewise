@@ -1,8 +1,12 @@
 //! stalewise supervises Varnish as a Kubernetes-aware HTTP cache.
 
 pub mod config;
+pub mod discovery;
 pub mod endpoint;
+pub mod metrics;
+pub mod reload;
 pub mod render;
+pub mod status;
 pub mod varnish;
 
 #[cfg(test)]

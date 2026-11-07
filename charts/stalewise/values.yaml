@@ -40,6 +40,8 @@ transientStorage: malloc,64m
 maxVcls: 5
 uncacheableTtl: 30s
 maxObjectSize: 10485760
+# Remove X-Forwarded-Host, X-Original-URL and X-Rewrite-URL from requests before hashing and fetching.
+stripRewriteHeaders: true
 varnishParams: []
 logLevel: info
 

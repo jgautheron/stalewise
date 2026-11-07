@@ -112,6 +112,8 @@ pub struct RenderSettings {
     pub probe_path: String,
     pub uncacheable_ttl: Duration,
     pub max_object_size: u64,
+    /// Remove X-Forwarded-Host, X-Original-URL and X-Rewrite-URL from every request.
+    pub strip_rewrite_headers: bool,
     pub shard: Option<ShardSettings>,
 }
 
@@ -166,6 +168,7 @@ pub struct Context {
     pub probe_path: String,
     pub uncacheable_ttl_seconds: u64,
     pub max_object_size: u64,
+    pub strip_rewrite_headers: bool,
     /// Accepted CachePolicies, most specific first; `id` is each one's VCL tag.
     pub policies: Vec<RenderPolicy>,
     pub shard: Option<ShardContext>,
@@ -198,6 +201,7 @@ impl Context {
             probe_path: settings.probe_path.clone(),
             uncacheable_ttl_seconds: settings.uncacheable_ttl.as_secs().max(1),
             max_object_size: settings.max_object_size,
+            strip_rewrite_headers: settings.strip_rewrite_headers,
             policies: policies.to_vec(),
             shard,
         })
@@ -497,6 +501,7 @@ mod tests {
             probe_path: "/healthz".into(),
             uncacheable_ttl: Duration::from_secs(30),
             max_object_size: 10_485_760,
+            strip_rewrite_headers: true,
             shard: None,
         }
     }

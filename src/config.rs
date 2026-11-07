@@ -252,6 +252,9 @@ pub struct Cli {
     pub uncacheable_ttl: Duration,
     #[arg(long, env = "STALEWISE_MAX_OBJECT_SIZE", default_value_t = 10_485_760)]
     pub max_object_size: u64,
+    /// Remove X-Forwarded-Host, X-Original-URL and X-Rewrite-URL before hashing and fetching.
+    #[arg(long, env = "STALEWISE_STRIP_REWRITE_HEADERS", num_args = 0..=1, default_missing_value = "true", default_value = "true", action = ArgAction::Set)]
+    pub strip_rewrite_headers: bool,
     #[arg(long, env = "STALEWISE_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
     /// Watch CachePolicy resources for the cached Service and render them.
@@ -400,6 +403,7 @@ pub struct Config {
     pub backend_probe_path: String,
     pub uncacheable_ttl: Duration,
     pub max_object_size: u64,
+    pub strip_rewrite_headers: bool,
     pub log_level: String,
     pub policies: Option<PolicyConfig>,
 }
@@ -620,6 +624,7 @@ impl Config {
             } else {
                 cli.max_object_size
             },
+            strip_rewrite_headers: cli.strip_rewrite_headers,
             policies,
             log_level: cli.log_level,
         })

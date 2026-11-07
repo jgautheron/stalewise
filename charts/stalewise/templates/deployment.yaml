@@ -122,6 +122,8 @@ spec:
               value: {{ .Values.uncacheableTtl | quote }}
             - name: STALEWISE_MAX_OBJECT_SIZE
               value: {{ .Values.maxObjectSize | int64 | toString | quote }}
+            - name: STALEWISE_STRIP_REWRITE_HEADERS
+              value: {{ .Values.stripRewriteHeaders | quote }}
             - name: STALEWISE_PURGE_ACL
               value: {{ include "stalewise.purgeAcl" . | quote }}
             - name: STALEWISE_LOG_LEVEL

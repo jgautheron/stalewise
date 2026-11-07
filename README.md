@@ -77,6 +77,8 @@ The embedded templates cache only what the origin's headers allow.
 - Responses without freshness information get a TTL of zero and are not stored.
 - `stale-while-revalidate` and `stale-if-error` become grace.
   Stale objects are served within the revalidation window while the origin is healthy, and within the larger window when the origin is sick.
+- `X-Forwarded-Host`, `X-Original-URL` and `X-Rewrite-URL` are removed from every request before hashing and the origin fetch, because an origin that honours them could serve one URL's content under another URL's key.
+  Set `--strip-rewrite-headers=false` (chart `stripRewriteHeaders: false`) only when the origin needs them and every caller is trusted.
 - Requests with `Authorization` or `Cookie`, and methods other than `GET` and `HEAD`, pass to the origin.
 - Only a WebSocket handshake (`GET` with `Upgrade: websocket`, `Connection: upgrade`, `Sec-WebSocket-Key` and `Sec-WebSocket-Version`) is piped.
   A WebSocket tunnel is unchecked by design: after the handshake, Varnish copies bytes in both directions and no VCL rule applies to them.

@@ -759,6 +759,7 @@ fn rendered_policy_vcl(origin_port: u16) -> String {
         probe_path: "/".into(),
         uncacheable_ttl: Duration::from_secs(30),
         max_object_size: 10_485_760,
+        strip_rewrite_headers: true,
         shard: None,
     };
     let origin = Endpoint::new(
@@ -1282,6 +1283,7 @@ fn ring_fixture(peers: &[(&str, &str)]) -> String {
         probe_path: "/".into(),
         uncacheable_ttl: Duration::from_secs(30),
         max_object_size: 10_485_760,
+        strip_rewrite_headers: true,
         shard: Some(ShardSettings {
             pod_name: "fixture".into(),
             peer_authority: PEER_AUTHORITY.parse().unwrap(),
@@ -1733,4 +1735,46 @@ async fn purge_uses_the_policy_cache_key_and_skips_bypass_and_method_rules() {
         !request(c.traffic, "HEAD", "/tenant", tenant).await.is_hit(),
         "header-keyed objects purge despite bypass and method rules"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn rewrite_headers_are_stripped_unless_opted_out() {
+    let (port, seen) = start_keepalive_origin().await;
+    let dir = temp_dir("rewrite-headers");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let spoof =
+        "X-Forwarded-Host: evil.test\r\nX-Original-URL: /admin\r\nX-Rewrite-URL: /admin\r\n";
+    let head = |path: &str| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .find(|h| h.starts_with(&format!("GET {path} ")))
+            .cloned()
+            .unwrap()
+            .to_ascii_lowercase()
+    };
+
+    let c = run_cache(&dir, &base_args(port)).await;
+    warm(c.traffic).await;
+    request(c.traffic, "GET", "/strip", spoof).await;
+    let stripped = head("/strip");
+    for name in ["x-forwarded-host", "x-original-url", "x-rewrite-url"] {
+        assert!(
+            !stripped.contains(name),
+            "{name} reached the origin: {stripped}"
+        );
+    }
+    assert!(
+        request(c.traffic, "GET", "/strip", "").await.is_hit(),
+        "the spoofed headers never split the key"
+    );
+    drop(c);
+
+    let mut args = base_args(port);
+    args.push("--strip-rewrite-headers=false".into());
+    let c = run_cache(&dir, &args).await;
+    warm(c.traffic).await;
+    request(c.traffic, "GET", "/kept", spoof).await;
+    assert!(head("/kept").contains("x-forwarded-host: evil.test"));
 }

@@ -538,6 +538,7 @@ mod tests {
                 probe_path: "/".into(),
                 uncacheable_ttl: Duration::from_secs(30),
                 max_object_size: 1,
+                strip_rewrite_headers: true,
                 shard: None,
             },
             max_vcls,

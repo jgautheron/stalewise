@@ -18,7 +18,8 @@ Raw templates remain a trusted expert mode. A deployment selects either generate
 2. Handle PURGE/BAN only after ACL validation and backend selection.
 3. Pipe only well-formed WebSocket handshakes (GET, `Upgrade: websocket`, `Connection: upgrade`, key and version) and keep `Connection: Upgrade` for them; the tunnel is unchecked by design. Any other Upgrade passes with `Upgrade` removed, and Expect passes. Every other pipe sends `Connection: close` so a later request on that connection cannot skip VCL. Stripping beats 501: RFC 9110 lets a server ignore Upgrade, so h2c-capable clients keep working over HTTP/1.1.
 4. Pass requests with Authorization or Cookie, and methods other than GET/HEAD.
-5. Preserve Varnish's native Range, If-Range, conditional request, and HEAD handling.
+5. Remove X-Forwarded-Host, X-Original-URL and X-Rewrite-URL before hashing and fetching, unless `--strip-rewrite-headers=false`. They are unkeyed inputs that some origins use to choose content, which enables cache poisoning.
+6. Preserve Varnish's native Range, If-Range, conditional request, and HEAD handling.
 
 Do not strip conditional headers globally or cache partial responses as complete objects. Default hash inputs are normalized authority and URL. Remove mesh request IDs from hash inputs; do not add tracing headers. Vary remains enforced and `Vary: *` is uncacheable.
 

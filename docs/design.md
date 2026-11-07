@@ -89,6 +89,7 @@ CLI overrides environment, then the `--config` file, then profile defaults. List
 | `--max-vcls` | `STALEWISE_MAX_VCLS` | 5 including active |
 | `--startup-timeout` | `STALEWISE_STARTUP_TIMEOUT` | 60s |
 | `--shutdown-timeout` | `STALEWISE_SHUTDOWN_TIMEOUT` | 30s |
+| `--strip-rewrite-headers` | `STALEWISE_STRIP_REWRITE_HEADERS` | true; removes X-Forwarded-Host, X-Original-URL, X-Rewrite-URL |
 | `--management-listen` | `STALEWISE_MANAGEMENT_LISTEN` | 0.0.0.0:9090 |
 | `--probe-listen` | `STALEWISE_PROBE_LISTEN` | 0.0.0.0:9091; `/healthz` and `/readyz` only, separate connection slots; bare IPv6 accepted |
 | `--signaller` | `STALEWISE_SIGNALLER` | false |

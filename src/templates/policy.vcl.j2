@@ -283,6 +283,12 @@ sub vcl_recv {
     if (req.restarts == 0) {
         call stalewise_clear_request;
     }
+{% if strip_rewrite_headers %}
+    # Origins that honour these would serve one URL's content under another URL's key.
+    unset req.http.X-Forwarded-Host;
+    unset req.http.X-Original-URL;
+    unset req.http.X-Rewrite-URL;
+{% endif %}
     if (req.url == "/__stalewise_probe") {
         if (client.ip ~ stalewise_loopback) {
             return (synth(200, "OK"));

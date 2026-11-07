@@ -108,6 +108,7 @@ fn render_settings(config: &Config) -> RenderSettings {
         probe_path: config.backend_probe_path.clone(),
         uncacheable_ttl: config.uncacheable_ttl,
         max_object_size: config.max_object_size,
+        strip_rewrite_headers: config.strip_rewrite_headers,
         shard: config.shard.as_ref().map(|shard| ShardSettings {
             pod_name: shard.pod_name.clone(),
             peer_authority: shard.peer_authority.clone(),

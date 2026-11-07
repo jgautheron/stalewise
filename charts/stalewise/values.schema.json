@@ -131,6 +131,9 @@
       "type": "string",
       "pattern": "^[^\\s]+$"
     },
+    "stripRewriteHeaders": {
+      "type": "boolean"
+    },
     "maxVcls": {
       "type": "integer",
       "minimum": 1

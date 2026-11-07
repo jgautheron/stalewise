@@ -142,10 +142,10 @@ v0.2 cacheable and attach methods are subsets of GET/HEAD. Arbitrary body-bearin
 
 Conditions use standard `type`, `status`, `reason`, `message`, `observedGeneration`, and `lastTransitionTime` fields. Expose:
 
-- `Accepted=True/Invalid=False` only after validated policy generation becomes active.
-- `Accepted=False/Invalid=True` for semantic errors, with reasons such as Conflict, UnknownService, InvalidOverride, or RenderFailed.
-- `Accepted=False/Invalid=False` while waiting on activation or a dependency; reason Pending or DependencyUnavailable.
-- `Attached=True/False/Unknown` independently reports route validation, including MissingRoute, MissingBypass, LoopDetected, or UnsupportedDataPlane.
+- `Accepted=True/Invalid=False` with reasons Active/Valid only after validated policy generation becomes active.
+- `Accepted=False/Invalid=True` for semantic errors, with reason Conflict, UnknownService, or InvalidOverride.
+- `Accepted=False/Invalid=False` with reason Pending while waiting on activation.
+- `Attached` independently reports route validation. `True` uses reason Attached. `False` uses NoVirtualService, MultipleVirtualServices, MissingSourceBypass, MissingHeaderBypass, MissingCacheRoute, UnrestrictedCacheRoute, or Loop. `Unknown` uses VirtualServicesUnavailable while VirtualServices cannot be listed.
 
 Schema-invalid writes fail API admission and cannot acquire status. Runtime-invalid updates leave the last accepted active policy unchanged; status identifies the rejected generation and last applied generation. Removing or correcting a conflict triggers reconciliation. A valid deletion returns that route to headers-only behavior through the normal transactional reload.
 

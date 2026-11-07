@@ -1,8 +1,8 @@
-# stalewise v0.2
+# stalewise v0.3
 
 ## Shape and interfaces
 
-One Rust 2024 binary crate supervises Varnish. It never handles cache traffic. It serves one application per deployment. v0.2 adds the `CachePolicy` resource, read-only attachment validation, and a structured config file.
+One Rust 2024 binary crate supervises Varnish. It never handles cache traffic. It serves one application per deployment. v0.2 added the `CachePolicy` resource, read-only attachment validation, and a structured config file. v0.3 adds stable peer membership, opt-in VCL sharding, and observable purge delivery.
 
 These are module contracts, not implementation. `Result<T>` carries the owning module's typed error. Invalid external inputs never reach rendering.
 

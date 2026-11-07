@@ -11,6 +11,7 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 ### Security
 
 - Only WebSocket handshakes are piped. Other `Upgrade` requests pass with the header removed, and `Expect` requests pass, so a declined upgrade can no longer tunnel later requests past VCL.
+- `--transient-storage` (`STALEWISE_TRANSIENT_STORAGE`, default `malloc,64m`) bounds the Transient stevedore, which Varnish otherwise leaves unbounded. The chart adds `transientStorage` and a default 512Mi memory limit.
 
 ### Changed
 

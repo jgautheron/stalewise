@@ -33,6 +33,8 @@ ports:
   management: 9090
 
 storage: malloc,256m
+# Uncacheable and short-lived objects; keep it finite so a slow client cannot exhaust memory.
+transientStorage: malloc,64m
 maxVcls: 5
 uncacheableTtl: 30s
 maxObjectSize: 10485760
@@ -100,7 +102,13 @@ serviceAccount:
 
 podAnnotations: {}
 podLabels: {}
-resources: {}
+# The memory limit budgets storage (256m) + transientStorage (64m) + ~190Mi process overhead.
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 512Mi
 nodeSelector: {}
 tolerations: []
 affinity: {}

@@ -153,6 +153,13 @@ pub struct Cli {
     pub admin_timeout: Duration,
     #[arg(long, env = "STALEWISE_STORAGE", default_value = "malloc,256m")]
     pub storage: String,
+    /// Stevedore for uncacheable and short-lived objects; Varnish leaves it unbounded otherwise.
+    #[arg(
+        long,
+        env = "STALEWISE_TRANSIENT_STORAGE",
+        default_value = "malloc,64m"
+    )]
+    pub transient_storage: String,
     #[arg(long, env = "STALEWISE_VARNISH_PARAM", value_delimiter = ',', action = ArgAction::Append)]
     pub varnish_param: Vec<String>,
     #[arg(long, env = "STALEWISE_MAX_VCLS", default_value_t = 5)]
@@ -357,6 +364,7 @@ pub struct Config {
     pub admin_secret_file: Option<PathBuf>,
     pub admin_timeout: Duration,
     pub storage: String,
+    pub transient_storage: String,
     pub varnish_params: Vec<VarnishParam>,
     pub max_vcls: usize,
     pub startup_timeout: Duration,
@@ -565,6 +573,7 @@ impl Config {
             admin_secret_file: cli.admin_secret_file,
             admin_timeout: positive("--admin-timeout", cli.admin_timeout)?,
             storage: opaque("--storage", cli.storage)?,
+            transient_storage: opaque("--transient-storage", cli.transient_storage)?,
             varnish_params: varnish_params(&cli.varnish_param)?,
             max_vcls: at_least_one("--max-vcls", cli.max_vcls)?,
             startup_timeout: positive("--startup-timeout", cli.startup_timeout)?,

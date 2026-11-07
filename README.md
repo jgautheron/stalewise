@@ -81,6 +81,7 @@ The embedded templates cache only what the origin's headers allow.
 - Other `Upgrade` requests pass to the origin with the `Upgrade` header removed, so the connection stays plain HTTP/1.1.
 - `Expect: 100-continue` requests pass to the origin.
 - `Set-Cookie`, `private`, `no-store`, `no-cache`, `Vary: *` and `text/event-stream` responses are never stored.
+- Uncacheable and streamed pass responses use the Transient store, bounded by `--transient-storage` (default `malloc,64m`).
 - Uncacheable responses become hit-for-miss objects for `--uncacheable-ttl` (default 30s).
 - Responses whose `Content-Length` exceeds `--max-object-size` (default 10 MiB) stream without being stored.
 - `Surrogate-Key` and `Cache-Tag` values are indexed for tag invalidation and removed before delivery.
@@ -200,6 +201,8 @@ Upgrade every replica before enabling sharding, and disable it before rolling ba
 The chart in [charts/stalewise](charts/stalewise) deploys one cache per application Service.
 It creates traffic, headless peer, and management Services, a namespaced Role for EndpointSlices, probes, a PodDisruptionBudget, and an optional NetworkPolicy.
 Pods run as uid 1000 with a read-only root filesystem and emptyDir work volumes.
+The default memory limit is 512Mi: `storage` (256m) plus `transientStorage` (64m) plus process overhead.
+Raise `resources.limits.memory` together with either store.
 
 Each release publishes the chart as an OCI artifact and the image at the same version:
 

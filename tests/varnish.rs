@@ -1656,3 +1656,32 @@ async fn declined_upgrade_never_tunnels_the_next_request_past_vcl() {
         "Expect requests pass through VCL instead of a pipe: {expect}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn transient_storage_is_bounded_by_default() {
+    let (port, _origin) = start_origin().await;
+    let dir = temp_dir("transient");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let c = run_cache(&dir, &base_args(port)).await;
+    let out = docker(&[
+        "exec",
+        &c.id,
+        "varnishstat",
+        "-n",
+        "/var/lib/varnish",
+        "-1",
+        "-f",
+        "SMA.Transient.g_space",
+    ]);
+    let space: u64 = out
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no Transient gauge: {out}"));
+    // An unbounded malloc stevedore reports zero available bytes.
+    assert!(
+        (1..=64 << 20).contains(&space),
+        "Transient must have a finite 64MiB budget: {space}"
+    );
+}

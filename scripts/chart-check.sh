@@ -33,6 +33,8 @@ validate "$out"
 
 helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog >"$out"
 expect 'name: catalog-cache-stalewise'
+expect 'value: "malloc,64m"'
+expect 'memory: 512Mi'
 if grep -qF 'cachepolicies' "$out"; then fail "policy RBAC rendered while cachePolicies is disabled"; fi
 if grep -qF 'kind: PeerAuthentication' "$out"; then fail "PeerAuthentication rendered by default"; fi
 validate "$out"

@@ -18,8 +18,10 @@ Launch without a shell:
 
 ```text
 varnishd -F -f <initial.vcl> -S <secret> -T <admin>
-         -a <frontend> -s <storage> -n <varnish-work-dir> [-p <key=value>...]
+         -a <frontend> -s <storage> -s Transient=<transient-storage> -n <varnish-work-dir> [-p <key=value>...]
 ```
+
+The Transient stevedore is always explicit and finite (default `malloc,64m`); Varnish otherwise leaves it unbounded, so uncacheable responses streamed to slow clients could exhaust memory. The chart's default memory limit budgets both stores plus process overhead.
 
 Use separate writable directories for generated files and Varnish state. Reject writable-by-others output directories and symlinked output path components. Open directory descriptors before writing. Use `openat` with `O_NOFOLLOW|O_CREAT|O_EXCL`, mode 0600, unpredictable temporary names, then descriptor-relative rename. Sync the file and directory. Never resolve a destination symlink. ConfigMap input symlinks are intentionally allowed; output symlinks are not.
 

@@ -39,6 +39,7 @@ pub struct ProcessConfig {
     pub admin: AdminConfig,
     pub listen: SocketAddr,
     pub storage: String,
+    pub transient_storage: String,
     pub work_dir: PathBuf,
     pub params: Vec<VarnishParam>,
     pub startup_timeout: Duration,
@@ -66,6 +67,8 @@ pub fn arguments(config: &ProcessConfig) -> Vec<OsString> {
         config.listen.to_string().into(),
         "-s".into(),
         config.storage.clone().into(),
+        "-s".into(),
+        format!("Transient={}", config.transient_storage).into(),
         "-n".into(),
         config.work_dir.clone().into(),
     ];
@@ -247,6 +250,7 @@ mod tests {
             admin,
             listen: "0.0.0.0:8080".parse().unwrap(),
             storage: "malloc,256m".into(),
+            transient_storage: "malloc,64m".into(),
             work_dir: "/var/lib/varnish".into(),
             params: vec![VarnishParam {
                 key: "thread_pools".into(),
@@ -283,6 +287,8 @@ mod tests {
                 "0.0.0.0:8080",
                 "-s",
                 "malloc,256m",
+                "-s",
+                "Transient=malloc,64m",
                 "-n",
                 "/var/lib/varnish",
                 "-p",

@@ -84,6 +84,7 @@ CLI overrides environment, then the `--config` file, then profile defaults. List
 | `--admin-secret-file` | `STALEWISE_ADMIN_SECRET_FILE` | generated work-dir/admin.secret |
 | `--admin-timeout` | `STALEWISE_ADMIN_TIMEOUT` | 5s |
 | `--storage` | `STALEWISE_STORAGE` | malloc,256m |
+| `--transient-storage` | `STALEWISE_TRANSIENT_STORAGE` | malloc,64m, rendered as `-s Transient=...` |
 | `--varnish-param` | `STALEWISE_VARNISH_PARAM` | empty key=value list |
 | `--max-vcls` | `STALEWISE_MAX_VCLS` | 5 including active |
 | `--startup-timeout` | `STALEWISE_STARTUP_TIMEOUT` | 60s |

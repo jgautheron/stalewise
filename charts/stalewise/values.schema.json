@@ -120,7 +120,11 @@
     },
     "storage": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^[^\\s]+$"
+    },
+    "transientStorage": {
+      "type": "string",
+      "pattern": "^[^\\s]+$"
     },
     "maxVcls": {
       "type": "integer",
@@ -325,7 +329,15 @@
       "type": "object"
     },
     "resources": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "limits": {
+          "type": "object"
+        },
+        "requests": {
+          "type": "object"
+        }
+      }
     },
     "nodeSelector": {
       "type": "object"

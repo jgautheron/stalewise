@@ -323,6 +323,7 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         admin,
         listen: config.listen,
         storage: config.storage.clone(),
+        transient_storage: config.transient_storage.clone(),
         work_dir: config.varnish_work_dir.clone(),
         params: config.varnish_params.clone(),
         startup_timeout: config.startup_timeout,

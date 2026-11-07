@@ -196,6 +196,8 @@ Test every module: configuration precedence, EndpointSlice merge/relist fixtures
 
 CI runs Docker `varnish:9.1.0`: both templates, header/stale/tag behavior, streaming, reload preservation, process death, and shutdown. Pin image digests; verify uid 1000 rather than trusting the tag. Enforce fmt/clippy/tests/deny; use non-root, read-only root, writable work volumes, separate Services, namespaced RBAC, probes, and pinned signed multi-arch packaging.
 
+Supply chain: `cargo deny` bans duplicate versions outside an explicit skip list, allows crates.io only, and checks advisories on every push and weekly. Dependabot proposes grouped weekly updates for cargo, Actions and Docker. `cargo vet` is not adopted: with one maintainer and no imported audit sets, it would record self-certifications rather than independent review.
+
 Build admin/render/process first, then discovery/reload, signaller/management, packaging. Restore previous template/config to roll back; remove traffic attachment before rolling back binaries. v0.2 owns structured policy/CRDs and attachment validation. v0.3 owns stable membership, opt-in sharding, and observable purge delivery. Shared-tier routing remains deferred. Delivery deadlines already belong to v0.1.
 
 ## v0.3

@@ -1,9 +1,13 @@
 [graph]
 all-features = false
+# Only the Linux image targets ship; Windows and UEFI crates never link.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [advisories]
 version = 2
 yanked = "deny"
+unmaintained = "all"
+unsound = "all"
 
 [licenses]
 version = 2
@@ -13,7 +17,6 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "Unicode-3.0",
@@ -21,9 +24,19 @@ allow = [
 ]
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
+# Each duplicate below comes from kube, ring or the proc-macro ecosystem, not from a direct dependency.
+skip = [
+    { crate = "base64@0.22.1", reason = "k8s-openapi lags kube-client" },
+    { crate = "getrandom@0.2.17", reason = "ring" },
+    { crate = "getrandom@0.3.4", reason = "ahash via kube-runtime" },
+    { crate = "hashbrown@0.16.1", reason = "kube-runtime" },
+    { crate = "syn@2.0.119", reason = "proc macros not yet on syn 3" },
+]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

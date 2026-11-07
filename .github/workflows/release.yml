@@ -22,7 +22,7 @@ jobs:
           version="${TAG#v}"
           chart=$(yq '.version' charts/stalewise/Chart.yaml)
           app=$(yq '.appVersion' charts/stalewise/Chart.yaml)
-          crate=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "stalewise") | .version')
+          crate=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "stalewise") | .version')
           [ "$chart" = "$version" ] || { echo "::error::Chart version $chart does not equal tag $version"; exit 1; }
           [ "$app" = "$crate" ] || { echo "::error::Chart appVersion $app does not equal Cargo.toml version $crate"; exit 1; }
           grep -qF "## [$version]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }

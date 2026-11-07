@@ -126,6 +126,9 @@ spec:
 - Prefixes match on segment boundaries, so `/api` matches `/api/x` but not `/apix`.
 - The longest matching prefix wins, and only that policy applies.
 - Two policies with the same prefix are both rejected with reason `Conflict`; the message names at most three rivals plus a count.
+- Prefixes and bypass paths match the raw request path.
+  When any CachePolicy is active, a path containing a dot segment (`/./`, `/../`), an empty segment (`//`), a backslash, or a percent-encoded slash, backslash or unreserved character (such as `%2F` or `%61`) passes to the origin uncached.
+  stalewise does not rewrite such paths, because the origin must receive the URL the client sent, and different origins resolve them differently.
 - At most `--max-cache-policies` (default 256) policies per cache are considered, oldest first by creation time, then by name.
   The rest are rejected with reason `TooManyPolicies` without being validated.
 - Removing a query name or cookie from the key can mix personalised responses, so list only names that never change the body per user.

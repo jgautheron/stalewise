@@ -723,6 +723,11 @@ fn ttl_policies() -> Vec<stalewise::policy::RenderPolicy> {
         ("query", "/q", "{ttlSeconds: 60, key: {queryAllowList: [page]}}"),
         ("asset", "/asset", "{ttlSeconds: 60, key: {queryAllowList: []}}"),
         (
+            "shop",
+            "/shop",
+            "{ttlSeconds: 60}\nbypass: [{pathPrefix: /shop/account}]",
+        ),
+        (
             "tenant",
             "/tenant",
             "{ttlSeconds: 60, cacheableMethods: [HEAD], key: {headers: [X-Tenant]}}\nbypass: [{header: {name: X-Preview, exact: \"true\"}}]",
@@ -1777,4 +1782,35 @@ async fn rewrite_headers_are_stripped_unless_opted_out() {
     warm(c.traffic).await;
     request(c.traffic, "GET", "/kept", spoof).await;
     assert!(head("/kept").contains("x-forwarded-host: evil.test"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn ambiguous_paths_never_dodge_policy_bypass_rules() {
+    let (port, _origin) = start_origin().await;
+    let dir = temp_dir("ambiguous-path");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    std::fs::write(dir.join("template.vcl"), rendered_policy_vcl(port)).unwrap();
+    let mut args = base_args(port);
+    args.push("--template=/config/template.vcl".into());
+    let c = run_cache(&dir, &args).await;
+    warm(c.traffic).await;
+
+    request(c.traffic, "GET", "/shop/item", "").await;
+    assert!(request(c.traffic, "GET", "/shop/item", "").await.is_hit());
+    for path in [
+        "/shop/account",
+        "/shop/./account",
+        "/shop/x/../account",
+        "/shop//account",
+        "/shop/%61ccount",
+        "/shop%2Faccount",
+        "/shop/.%2e/shop/account",
+    ] {
+        request(c.traffic, "GET", path, "").await;
+        assert!(
+            !request(c.traffic, "GET", path, "").await.is_hit(),
+            "{path} was stored despite the bypass rule"
+        );
+    }
 }

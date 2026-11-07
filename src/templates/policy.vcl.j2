@@ -222,6 +222,13 @@ sub stalewise_policy_key {
 
 # Bypass and method rules win before any lookup.
 sub stalewise_policy_request {
+{% if policies %}
+    # Prefixes match raw paths; dot segments, empty segments and encoded slashes or unreserved
+    # characters could dodge a bypass rule, so such paths never reach the cache.
+    if (req.url ~ "^(?i)[^?]*(//|/\.\.?(/|\?|$)|\\|%(2[def]|3[0-9]|4[1-9a-f]|5[0-9acf]|6[1-9a-f]|7[0-9ae]))") {
+        return (pass);
+    }
+{% endif %}
     call stalewise_policy_match;
 {% for p in policies %}
     if (req.http.X-Stalewise-Policy == "{{ p.id }}") {

@@ -17,6 +17,7 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 - `PURGE` applies the CachePolicy query allow-list and key headers, so it removes objects stored under a normalized key. Before, `PURGE /asset?tracking=x` missed an object stored as `/asset`.
 - Kubelet probes use a dedicated `--probe-listen` listener (default `0.0.0.0:9091`; chart port `probe`, bound on the pod IP) with its own connection slots, so 128 idle management connections can no longer fail liveness.
 - `X-Forwarded-Host`, `X-Original-URL` and `X-Rewrite-URL` are removed from requests before hashing and the origin fetch. `--strip-rewrite-headers=false` (chart `stripRewriteHeaders`) opts out.
+- While a CachePolicy is active, paths with dot segments, empty segments, backslashes, or percent-encoded slash, backslash or unreserved characters pass uncached, so `/shop/./account` can no longer dodge a `/shop/account` bypass rule.
 
 ### Changed
 

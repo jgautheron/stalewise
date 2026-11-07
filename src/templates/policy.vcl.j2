@@ -17,10 +17,14 @@ sub stalewise_clear_request {
     unset req.http.X-Stalewise-Fresh;
     unset req.http.X-Stalewise-Tags;
     unset req.http.X-Stalewise-Host;
+    unset req.http.X-Stalewise-Refetch;
+    unset req.http.X-Stalewise-Stale;
 }
 
 sub vcl_recv {
-    call stalewise_clear_request;
+    if (req.restarts == 0) {
+        call stalewise_clear_request;
+    }
     if (req.url == "/__stalewise_probe") {
         if (client.ip ~ stalewise_loopback) {
             return (synth(200, "OK"));
@@ -99,6 +103,12 @@ sub vcl_hit {
     if (obj.ttl >= 0s) {
         return (deliver);
     }
+    if (req.http.X-Stalewise-Stale) {
+        if (obj.ttl + std.duration(obj.http.X-Stalewise-Sie + "s", 0s) > 0s) {
+            return (deliver);
+        }
+        return (synth(503, "Service Unavailable"));
+    }
     if (std.healthy(req.backend_hint)) {
         if (obj.ttl + std.duration(obj.http.X-Stalewise-Swr + "s", 0s) > 0s) {
             return (deliver);
@@ -107,10 +117,23 @@ sub vcl_hit {
         return (deliver);
     }
     if (req.restarts == 0) {
+        if (obj.ttl + std.duration(obj.http.X-Stalewise-Sie + "s", 0s) > 0s) {
+            set req.http.X-Stalewise-Refetch = "1";
+        }
         set req.hash_always_miss = true;
         return (restart);
     }
     return (pass);
+}
+
+# A failed refetch was abandoned: look the stale object up again instead of storing the error.
+sub vcl_synth {
+    if (req.http.X-Stalewise-Refetch && !req.http.X-Stalewise-Stale && resp.status == 503) {
+        unset req.http.X-Stalewise-Refetch;
+        set req.http.X-Stalewise-Stale = "1";
+        set req.hash_always_miss = false;
+        return (restart);
+    }
 }
 
 sub vcl_backend_fetch {
@@ -259,7 +282,7 @@ sub stalewise_tags {
 
 sub vcl_backend_response {
     call stalewise_clear_response;
-    if (bereq.is_bgfetch && beresp.status >= 500) {
+    if ((bereq.is_bgfetch || bereq.http.X-Stalewise-Refetch) && beresp.status >= 500) {
         return (abandon);
     }
     set beresp.do_stream = true;
@@ -289,7 +312,7 @@ sub vcl_backend_response {
 }
 
 sub vcl_backend_error {
-    if (bereq.is_bgfetch) {
+    if (bereq.is_bgfetch || bereq.http.X-Stalewise-Refetch) {
         return (abandon);
     }
 }

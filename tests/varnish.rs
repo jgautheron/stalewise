@@ -1,6 +1,6 @@
 //! End-to-end checks against the real `varnish:9.1.0` image; run with `cargo test -- --ignored`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,11 +52,12 @@ fn build_image_once() {
     });
 }
 
-/// Origin state: per-path hit counts and the last Host header seen.
+/// Origin state: per-path hit counts, the last Host header seen, and paths forced to 500.
 #[derive(Default)]
 struct Origin {
     hits: HashMap<String, usize>,
     last_host: Option<String>,
+    failing: HashSet<String>,
 }
 
 type SharedOrigin = Arc<Mutex<Origin>>;
@@ -88,6 +89,7 @@ fn route(path: &str, n: usize) -> (StatusCode, Vec<(&'static str, String)>, Stri
             body,
         ),
         "/nofresh" => (StatusCode::OK, vec![], body),
+        "/flaky" => (StatusCode::OK, cc("max-age=1, stale-if-error=120"), body),
         "/events" => (
             StatusCode::OK,
             vec![
@@ -116,13 +118,20 @@ async fn origin_handler(origin: SharedOrigin, req: Request<Incoming>) -> Respons
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned);
     let _ = req.into_body().collect().await;
-    let n = {
+    let (n, failing) = {
         let mut o = origin.lock().unwrap();
         o.last_host = host;
+        let failing = o.failing.contains(&path);
         let n = o.hits.entry(path.clone()).or_default();
         *n += 1;
-        *n
+        (*n, failing)
     };
+    if failing {
+        return http::text(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Bytes::from("origin error"),
+        );
+    }
     let (status, headers, body) = route(&path, n);
     let mut resp = http::text(status, Bytes::from(body));
     for (k, v) in headers {
@@ -489,3 +498,42 @@ async fn mesh_profile_rewrites_authority_and_child_death_is_fatal() {
     let exit = docker(&["wait", &c.id]);
     assert_eq!(exit, "1", "child death exits nonzero: {}", logs(&c.id));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn origin_5xx_then_sick_keeps_serving_stale_if_error() {
+    let (port, origin) = start_origin().await;
+    let dir = temp_dir("stale-if-error");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let c = run_cache(&dir, &base_args(port)).await;
+    warm(c.traffic).await;
+    let first = request(c.traffic, "GET", "/flaky", "").await;
+    assert_eq!(first.body, "/flaky #1");
+    origin.lock().unwrap().failing.insert("/flaky".into());
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    for _ in 0..3 {
+        let stale = request(c.traffic, "GET", "/flaky", "").await;
+        assert_eq!(
+            (stale.status, stale.body.as_str()),
+            (200, "/flaky #1"),
+            "a refetch 5xx serves stale and stores no hit-for-miss"
+        );
+    }
+    assert!(hits(&origin, "/flaky") >= 2, "the origin was asked again");
+
+    origin.lock().unwrap().failing.insert("/".into());
+    let mut previous = hits(&origin, "/flaky");
+    wait_for("origin marked sick", Duration::from_secs(30), async || {
+        let stale = request(c.traffic, "GET", "/flaky", "").await;
+        assert_eq!((stale.status, stale.body.as_str()), (200, "/flaky #1"));
+        let now = hits(&origin, "/flaky");
+        let quiet = now == previous;
+        previous = now;
+        quiet
+    })
+    .await;
+    let stale = request(c.traffic, "GET", "/flaky", "").await;
+    assert_eq!((stale.status, stale.body.as_str()), (200, "/flaky #1"));
+}
+

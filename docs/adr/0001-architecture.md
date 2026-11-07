@@ -105,7 +105,7 @@ Record this as `stalewise:uncacheable_request_share:ratio`. `cache_hitpass` is a
 
 Use digest-pinned stable Rust/bookworm builder and `varnish:9.1.0` runtime images. Verify matching libc, amd64/arm64 support, UID, writable VSM/compiler paths, and executable permissions in CI. Mount writable `/tmp` if the compiler requires it. No privileged ports or additional capabilities are needed.
 
-The chart provides distinct traffic, headless discovery, and management Services, namespaced EndpointSlice get/list/watch permissions, probes, disruption budget, optional NetworkPolicy, and a values schema. The optional signaller can use a separate port on the traffic Service. Restrict its exposure independently. Pin build actions by SHA and attach SBOM, provenance, and keyless signatures.
+The chart provides distinct traffic, headless discovery, and management Services, namespaced EndpointSlice get/list/watch permissions, probes, disruption budget, optional NetworkPolicy, and a values schema. The optional signaller can use a separate port on the traffic Service. Restrict its exposure independently. Pin build actions by SHA and attach SBOM, provenance, and keyless signatures. Sign the index digest that the merge step itself reports (`imagetools create --metadata-file`); never select the signing subject by re-reading a registry tag, which anyone with push access can repoint.
 
 ## Consequences
 

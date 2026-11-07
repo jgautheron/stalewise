@@ -213,6 +213,7 @@ helm install catalog-cache oci://ghcr.io/jgautheron/charts/stalewise --version 0
 
 The chart defaults `image.tag` to its `appVersion`, so it pulls `ghcr.io/jgautheron/stalewise:0.3.0`.
 Images are signed keylessly with cosign from the release workflow.
+The signature covers the exact index digest the workflow created, never whatever a tag points to later.
 Verify a signature before you deploy:
 
 ```sh

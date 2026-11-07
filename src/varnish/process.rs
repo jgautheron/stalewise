@@ -300,10 +300,12 @@ mod tests {
     #[tokio::test]
     async fn child_exit_during_startup_is_an_error() {
         let (tx, rx) = watch::channel(ProcessState::Starting);
-        let cfg = config(
+        let mut cfg = config(
             script("echo 'At: (x Line 1 Pos 1)'; echo secret_source; exit 0"),
             dead_admin(),
         );
+        // The admin port is dead, so with no reachable timeout only the child's exit can end startup.
+        cfg.startup_timeout = Duration::from_secs(3600);
         let err = supervise(cfg, tx, CancellationToken::new())
             .await
             .unwrap_err();

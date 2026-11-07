@@ -213,13 +213,23 @@ impl Reply {
 }
 
 async fn request(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply {
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    try_request(addr, method, path, extra).await.unwrap()
+}
+
+/// Readiness probes use this: Docker's port proxy accepts and then resets until the listener is up.
+async fn try_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    extra: &str,
+) -> std::io::Result<Reply> {
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: Catalog.Test\r\nConnection: close\r\n{extra}Content-Length: 0\r\n\r\n"
     );
-    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.write_all(req.as_bytes()).await?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.unwrap();
+    stream.read_to_end(&mut raw).await?;
     let text = String::from_utf8_lossy(&raw).into_owned();
     let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     let mut lines = head.lines();
@@ -232,11 +242,11 @@ async fn request(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Rep
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
         .collect();
-    Reply {
+    Ok(Reply {
         status,
         headers,
         body: body.to_owned(),
-    }
+    })
 }
 
 fn mapped(container: &str, port: &str) -> SocketAddr {
@@ -327,7 +337,9 @@ async fn run_cache_with(config_dir: &Path, docker_extra: &[String], args: &[Stri
     wait_for("readiness", Duration::from_secs(90), async || {
         let state = docker(&["inspect", "-f", "{{.State.Running}}", &id]);
         assert_eq!(state, "true", "container exited: {}", logs(&id));
-        request(management, "GET", "/readyz", "").await.status == 200
+        try_request(management, "GET", "/readyz", "")
+            .await
+            .is_ok_and(|r| r.status == 200)
     })
     .await;
     c
@@ -1350,10 +1362,9 @@ impl RingHost {
         ]);
         let addr = mapped(&id, "8080/tcp");
         wait_for("fixture varnishd", Duration::from_secs(60), async || {
-            request(addr, "GET", "/", "X-Fixture-Int: 1\r\n")
+            try_request(addr, "GET", "/", "X-Fixture-Int: 1\r\n")
                 .await
-                .status
-                == 200
+                .is_ok_and(|r| r.status == 200)
         })
         .await;
         Self {

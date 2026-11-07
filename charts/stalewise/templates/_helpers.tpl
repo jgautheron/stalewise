@@ -1,12 +1,17 @@
 {{- define "stalewise.name" -}}
-{{- .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- define "stalewise.fullname" -}}
-{{- if contains .Chart.Name .Release.Name -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 50 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- if contains $name .Release.Name -}}
 {{- .Release.Name | trunc 50 | trimSuffix "-" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 50 | trimSuffix "-" -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 50 | trimSuffix "-" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -57,4 +62,14 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- if or .Values.template.inline .Values.template.existingConfigMap -}}
 {{- printf "/etc/stalewise/template/%s" .Values.template.key -}}
 {{- end -}}
+{{- end -}}
+
+
+{{/* Comma-separated selector labels; the controller matches them against VirtualService sourceLabels. */}}
+{{- define "stalewise.sourceLabels" -}}
+{{- $labels := list -}}
+{{- range $k, $v := (include "stalewise.selectorLabels" . | fromYaml) -}}
+{{- $labels = append $labels (printf "%s=%s" $k $v) -}}
+{{- end -}}
+{{- join "," $labels -}}
 {{- end -}}

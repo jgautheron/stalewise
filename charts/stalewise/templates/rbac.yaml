@@ -8,6 +8,19 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.cachePolicies.enabled }}
+  - apiGroups: ["stalewise.dev"]
+    resources: ["cachepolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["stalewise.dev"]
+    resources: ["cachepolicies/status"]
+    verbs: ["update", "patch"]
+  {{- if .Values.cachePolicies.validateAttachment }}
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

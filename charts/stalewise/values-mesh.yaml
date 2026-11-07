@@ -1,5 +1,7 @@
 # Mesh profile: one Service DNS origin balanced by the sidecar, peers purge via 127.0.0.6.
 profile: mesh
+# Names every resource catalog-cache, the Service host the VirtualService routes to.
+fullnameOverride: catalog-cache
 backend:
   watch: false
   host: catalog.apps.svc.cluster.local
@@ -15,3 +17,17 @@ mesh:
   authorizationPolicy: true
 podAnnotations:
   sidecar.istio.io/inject: "true"
+cachePolicies:
+  enabled: true
+  policies:
+    - name: catalog
+      spec:
+        serviceRef:
+          name: catalog
+        pathPrefix: /
+        overrides:
+          graceSeconds: 30
+        bypass:
+          - pathPrefix: /account
+        attach:
+          mode: route

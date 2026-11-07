@@ -6,6 +6,10 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
+# Override the chart name in resource names, or the whole resource name prefix.
+nameOverride: ""
+fullnameOverride: ""
+
 replicaCount: 2
 
 # generic watches origin EndpointSlices; mesh uses one Service DNS origin.
@@ -53,6 +57,16 @@ signaller:
   deliveryDeadline: 10s
   # Host header for peer deliveries; empty means the headless peers Service FQDN and port.
   peerAuthority: ""
+
+# CachePolicy resources (stalewise.dev/v1alpha1); incompatible with a raw template.
+cachePolicies:
+  enabled: false
+  # Report route attachment on CachePolicy status; needs VirtualService read access.
+  validateAttachment: true
+  # Service policies must reference; defaults to backend.service or the first backend.host label.
+  service: ""
+  # CachePolicies this release ships: [{name, spec}]; spec follows the CRD.
+  policies: []
 
 # Extra purge ACL entries beyond loopback and the signaller defaults.
 purgeAcl: []

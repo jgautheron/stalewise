@@ -44,6 +44,11 @@ jobs:
       - name: Numeric values render as integers, not scientific notation
         run: |
           if helm template t charts/stalewise --set backend.service=catalog | grep -nE '"[0-9.]+e\+[0-9]+"'; then exit 1; fi
+      - name: Install kubeconform
+        run: |
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - run: scripts/chart-check.sh
 
   integration:
     runs-on: ubuntu-24.04

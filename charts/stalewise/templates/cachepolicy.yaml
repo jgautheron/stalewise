@@ -1,0 +1,11 @@
+{{- range .Values.cachePolicies.policies }}
+---
+apiVersion: stalewise.dev/v1alpha1
+kind: CachePolicy
+metadata:
+  name: {{ required "cachePolicies.policies[].name is required" .name }}
+  labels:
+    {{- include "stalewise.labels" $ | nindent 4 }}
+spec:
+  {{- toYaml (required "cachePolicies.policies[].spec is required" .spec) | nindent 2 }}
+{{- end }}

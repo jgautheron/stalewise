@@ -37,6 +37,16 @@
         "type": "object"
       }
     },
+    "nameOverride": {
+      "type": "string",
+      "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
+      "maxLength": 50
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$",
+      "maxLength": 50
+    },
     "replicaCount": {
       "type": "integer",
       "minimum": 1
@@ -199,6 +209,46 @@
         },
         "peerAuthority": {
           "type": "string"
+        }
+      }
+    },
+    "cachePolicies": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "validateAttachment": {
+          "type": "boolean"
+        },
+        "service": {
+          "type": "string",
+          "pattern": "^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)?$"
+        },
+        "policies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "spec"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$"
+              },
+              "spec": {
+                "type": "object",
+                "required": [
+                  "serviceRef",
+                  "pathPrefix"
+                ]
+              }
+            }
+          }
         }
       }
     },

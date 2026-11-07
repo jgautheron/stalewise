@@ -6,6 +6,7 @@
 {{- if and $watch (not .Values.backend.service) }}{{ fail "backend.service is required when watching origins" }}{{ end }}
 {{- if and (not $watch) (not .Values.backend.host) }}{{ fail "backend.host is required for a static origin" }}{{ end }}
 {{- if and .Values.signaller.enabled (not .Values.signaller.tokenSecret.name) }}{{ fail "signaller.tokenSecret.name is required" }}{{ end }}
+{{- if and .Values.cachePolicies.enabled (include "stalewise.templatePath" .) }}{{ fail "cachePolicies.enabled conflicts with a raw template" }}{{ end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -124,6 +125,18 @@ spec:
             {{- with .Values.template.env }}
             - name: STALEWISE_TEMPLATE_ENV
               value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.cachePolicies.enabled }}
+            - name: STALEWISE_CACHE_POLICIES
+              value: "true"
+            - name: STALEWISE_VALIDATE_ATTACHMENT
+              value: {{ .Values.cachePolicies.validateAttachment | quote }}
+            - name: STALEWISE_CACHE_SOURCE_LABELS
+              value: {{ include "stalewise.sourceLabels" . | quote }}
+            {{- with .Values.cachePolicies.service }}
+            - name: STALEWISE_POLICY_SERVICE
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.signaller.enabled }}
             - name: STALEWISE_SIGNALLER

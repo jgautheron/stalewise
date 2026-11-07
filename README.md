@@ -128,7 +128,7 @@ An invalid policy never replaces the active VCL.
 `--cache-policies` cannot be combined with `--template`: a raw template owns the whole policy.
 
 With `attach` set and `--validate-attachment` on (the default with `--cache-policies`), stalewise reads the application's VirtualServices and reports an `Attached` condition.
-Reasons include `Attached`, `NoVirtualService`, `MissingSourceBypass`, `MissingHeaderBypass`, `MissingCacheRoute`, `UnrestrictedCacheRoute` and `Loop`.
+Reasons include `Attached`, `NoVirtualService`, `MultipleVirtualServices`, `MissingSourceBypass`, `MissingHeaderBypass`, `MissingCacheRoute`, `UnrestrictedCacheRoute` and `Loop`, plus `VirtualServicesUnavailable` with status `Unknown` while VirtualServices cannot be listed.
 stalewise never creates or changes a VirtualService, and a static check cannot prove that the data plane applied a route.
 Pass the cache pods' labels with `--cache-source-labels` so the check can match the source bypass rule.
 
@@ -198,6 +198,25 @@ The chart in [charts/stalewise](charts/stalewise) deploys one cache per applicat
 It creates traffic, headless peer, and management Services, a namespaced Role for EndpointSlices, probes, a PodDisruptionBudget, and an optional NetworkPolicy.
 Pods run as uid 1000 with a read-only root filesystem and emptyDir work volumes.
 
+Each release publishes the chart as an OCI artifact and the image at the same version:
+
+```sh
+helm install catalog-cache oci://ghcr.io/jgautheron/charts/stalewise --version 0.3.0 \
+  --set backend.service=catalog --set fullnameOverride=catalog-cache
+```
+
+The chart defaults `image.tag` to its `appVersion`, so it pulls `ghcr.io/jgautheron/stalewise:0.3.0`.
+Images are signed keylessly with cosign from the release workflow.
+Verify a signature before you deploy:
+
+```sh
+cosign verify ghcr.io/jgautheron/stalewise:0.3.0 \
+  --certificate-identity-regexp '^https://github.com/jgautheron/stalewise/.github/workflows/image.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+From a source checkout:
+
 ```sh
 helm install catalog-cache charts/stalewise --set backend.service=catalog --set fullnameOverride=catalog-cache
 helm install catalog-cache charts/stalewise -f charts/stalewise/values-mesh.yaml
@@ -229,6 +248,8 @@ Regenerate the CRD after changing the Rust types with `cargo run -- crd > charts
 
 When `mesh.sidecar` is true with `signaller.enabled` or `shard.enabled`, the chart fails unless `mesh.authorizationPolicy` is also true.
 With `shard.enabled`, that policy also denies `x-stalewise-shard-hop` requests from any other identity.
+Set `mesh.peerAuthentication=true` to render a `security.istio.io/v1` PeerAuthentication that requires STRICT mTLS for the cache pods.
+Without it, make sure the mesh already enforces STRICT mTLS, because the AuthorizationPolicy relies on peer identities.
 
 ## Attaching traffic with `cache.enabled`
 

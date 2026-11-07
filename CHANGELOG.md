@@ -1,0 +1,60 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+0.3.0 is the first tagged release.
+The 0.1.0 and 0.2.0 sections describe untagged development milestones whose changes ship in 0.3.0.
+
+## [0.3.0] - 2026-11-07
+
+### Added
+
+- `--shard` renders a `directors.shard()` ring keyed by `namespace/pod`, so a cold object is filled once per Deployment.
+- Non-owners forward misses to the owner once with trusted `X-Stalewise-Shard-Hop` headers and fall back to the origin on failure.
+- `--shard-local-ttl` lets non-owners keep short copies capped by the owner's remaining freshness.
+- Each invalidation gets an ID, a `Location: /invalidations/<id>` status and per-target `pending`, `delivered` or `exhausted` results.
+- `GET /invalidations/<id>?wait=` and the `X-Stalewise-Wait` write header wait for delivery and return 504 on timeout.
+- `--invalidation-history` bounds retained invalidation records.
+- `--pod-name` and `--membership-debounce` give peers a stable, debounced `namespace/pod` identity.
+- Metrics `stalewise_invalidation_latency_seconds` and `stalewise_invalidation_peers_lagging`.
+- Chart values for sharding and pod identity, and an AuthorizationPolicy rule that restricts hop headers to the cache's identity.
+- Chart value `mesh.peerAuthentication` renders an optional STRICT mTLS PeerAuthentication for the cache pods.
+- The release workflow publishes the chart to `oci://ghcr.io/jgautheron/charts/stalewise` and creates a GitHub release.
+
+### Milestone 0.2.0
+
+These changes were never tagged separately and first ship in 0.3.0.
+
+- The namespaced `stalewise.dev/v1alpha1` `CachePolicy` resource with typed overrides, bypass rules and `Accepted`/`Invalid` status.
+- Read-only attachment validation against Istio VirtualServices, reported in an `Attached` condition.
+- The `--config` YAML file and the `stalewise crd` subcommand.
+- Chart support for the CachePolicy CRD, policy RBAC, policies from dependent charts and `nameOverride`/`fullnameOverride`.
+
+### Milestone 0.1.0
+
+These changes were never tagged separately and first ship in 0.3.0.
+
+- `varnishd` supervision with transactional VCL reloads that keep the last good VCL.
+- EndpointSlice discovery for peers and, in the generic profile, the origin.
+- Generic and mesh VCL templates that cache only what origin headers allow.
+- A token-authenticated signaller that broadcasts `PURGE` and tag `BAN` to every peer.
+- Management endpoints `/healthz`, `/readyz` and `/metrics`.
+- A signed multi-arch container image, the Helm chart and real Varnish integration tests.
+
+### Fixed
+
+- Peer deliveries send `--peer-authority` as `Host`, so sidecars no longer route them to the origin.
+- The purge ACL trusts discovered peer pod addresses instead of pod CIDRs.
+- A dual-stack pod counts as one peer.
+- A candidate that `vcl.use` rejects is no longer retried forever.
+- A `--listen` address that the readiness probe cannot reach is rejected at startup.
+- An early exit of any background task is fatal instead of silently leaving the pod ready.
+- The chart refuses a sidecar signaller without the AuthorizationPolicy.
+- `Cache-Control` stale windows shrink by `Age`.
+- `stale-if-error` serves the stale object when a foreground refetch fails.
+- Tag bans match stored objects.
+- Task exits after a shutdown request count as orderly.
+- The chart renders numeric environment values as integers.
+
+[0.3.0]: https://github.com/jgautheron/stalewise/releases/tag/v0.3.0

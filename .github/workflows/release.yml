@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.versions.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: versions
+        name: Tag, chart and crate versions agree
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          chart=$(yq '.version' charts/stalewise/Chart.yaml)
+          app=$(yq '.appVersion' charts/stalewise/Chart.yaml)
+          crate=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "stalewise") | .version')
+          [ "$chart" = "$version" ] || { echo "::error::Chart version $chart does not equal tag $version"; exit 1; }
+          [ "$app" = "$crate" ] || { echo "::error::Chart appVersion $app does not equal Cargo.toml version $crate"; exit 1; }
+          grep -qF "## [$version]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  chart:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Package and push the chart
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
+          helm package charts/stalewise --destination dist
+          helm push "dist/stalewise-${VERSION}.tgz" oci://ghcr.io/jgautheron/charts
+
+  github-release:
+    needs: [verify, chart]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Create the release from the CHANGELOG section
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          awk -v head="## [${VERSION}]" '
+            index($0, head) == 1 { found = 1; next }
+            found && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "::error::Empty release notes for $VERSION"; exit 1; }
+          gh release create "$TAG" --verify-tag --title "stalewise $VERSION" --notes-file notes.md

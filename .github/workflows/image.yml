@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# An older main build must never finish last and repoint edge; release tags always complete.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
 env:
   IMAGE: ghcr.io/jgautheron/stalewise
 

@@ -121,7 +121,9 @@ spec:
 
 - Prefixes match on segment boundaries, so `/api` matches `/api/x` but not `/apix`.
 - The longest matching prefix wins, and only that policy applies.
-- Two policies with the same prefix are both rejected with reason `Conflict`.
+- Two policies with the same prefix are both rejected with reason `Conflict`; the message names at most three rivals plus a count.
+- At most `--max-cache-policies` (default 256) policies per cache are considered, oldest first by creation time, then by name.
+  The rest are rejected with reason `TooManyPolicies` without being validated.
 - Removing a query name or cookie from the key can mix personalised responses, so list only names that never change the body per user.
 - A rejected update keeps the last accepted generation of that policy in force.
   The status shows the rejected `observedGeneration` and the enforced `activeGeneration`.

@@ -77,6 +77,8 @@ cachePolicies:
   enabled: false
   # Report route attachment on CachePolicy status; needs VirtualService read access.
   validateAttachment: true
+  # CachePolicies rendered per cache; older policies win and the rest get reason TooManyPolicies.
+  maxPolicies: 256
   # Service policies must reference; defaults to backend.service or the first backend.host label.
   service: ""
   # CachePolicies this release ships: [{name, spec}]; spec follows the CRD.

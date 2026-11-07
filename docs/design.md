@@ -111,6 +111,7 @@ CLI overrides environment, then the `--config` file, then profile defaults. List
 | `--log-level` | `STALEWISE_LOG_LEVEL` | info |
 | `--config` | `STALEWISE_CONFIG` | —; YAML file, see below |
 | `--cache-policies` | `STALEWISE_CACHE_POLICIES` | false; conflicts with `--template` |
+| `--max-cache-policies` | `STALEWISE_MAX_CACHE_POLICIES` | 256; oldest admitted, excess Invalid/TooManyPolicies |
 | `--policy-service` | `STALEWISE_POLICY_SERVICE` | origin Service, or first label of a static origin host |
 | `--validate-attachment` | `STALEWISE_VALIDATE_ATTACHMENT` | value of `--cache-policies` |
 | `--cache-source-labels` | `STALEWISE_CACHE_SOURCE_LABELS` | empty key=value list; required with attachment validation |

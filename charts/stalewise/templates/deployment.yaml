@@ -141,6 +141,8 @@ spec:
               value: {{ .Values.cachePolicies.validateAttachment | quote }}
             - name: STALEWISE_CACHE_SOURCE_LABELS
               value: {{ include "stalewise.sourceLabels" . | quote }}
+            - name: STALEWISE_MAX_CACHE_POLICIES
+              value: {{ .Values.cachePolicies.maxPolicies | int64 | toString | quote }}
             {{- with .Values.cachePolicies.service }}
             - name: STALEWISE_POLICY_SERVICE
               value: {{ . | quote }}

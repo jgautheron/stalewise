@@ -126,6 +126,9 @@ async fn reconcile(
         .into_iter()
         .filter(|p| p.spec.service_ref.name == config.own.name)
         .collect();
+    let (owned, excess) = policy::admit(owned, config.max_policies, |p| {
+        (p.metadata.creation_timestamp.clone(), p.name_any())
+    });
     let candidates: Vec<Candidate> = owned
         .iter()
         .map(|p| Candidate {
@@ -168,6 +171,26 @@ async fn reconcile(
         let status = desired_status(&p, verdict, accepted.get(&name), &attachment, &now);
         if !same_status(p.status.as_ref(), &status) {
             write_status(api, &name, status).await;
+        }
+    }
+    reject_excess(api, excess, config.max_policies, &now).await;
+}
+
+/// Marks policies past the budget Invalid without validating or attaching them.
+async fn reject_excess(
+    api: &Api<CachePolicy>,
+    excess: Vec<Arc<CachePolicy>>,
+    max: usize,
+    now: &Time,
+) {
+    if !excess.is_empty() {
+        tracing::warn!(rejected = excess.len(), max, "CachePolicy budget exceeded");
+    }
+    let verdict = policy::over_budget(max);
+    for p in excess {
+        let status = desired_status(&p, &verdict, None, &Attachment::NotRequested, now);
+        if !same_status(p.status.as_ref(), &status) {
+            write_status(api, &p.name_any(), status).await;
         }
     }
 }

@@ -238,6 +238,9 @@ pub struct Cli {
     /// Watch CachePolicy resources for the cached Service and render them.
     #[arg(long, env = "STALEWISE_CACHE_POLICIES", num_args = 0..=1, default_missing_value = "true", default_value = "false", action = ArgAction::Set)]
     pub cache_policies: bool,
+    /// CachePolicies rendered per cache; older policies win and the rest are marked Invalid.
+    #[arg(long, env = "STALEWISE_MAX_CACHE_POLICIES", default_value_t = 256)]
+    pub max_cache_policies: usize,
     /// Service name policies must reference; defaults to the origin Service.
     #[arg(long, env = "STALEWISE_POLICY_SERVICE")]
     pub policy_service: Option<String>,
@@ -387,6 +390,7 @@ pub struct PolicyConfig {
     pub namespace: String,
     pub own: OwnService,
     pub attachment: Option<AttachConfig>,
+    pub max_policies: usize,
 }
 
 /// Identities the read-only route validator compares against.
@@ -619,6 +623,7 @@ fn policy_config(
         namespace: namespace.to_owned(),
         own,
         attachment,
+        max_policies: at_least_one("--max-cache-policies", cli.max_cache_policies)?,
     }))
 }
 

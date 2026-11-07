@@ -143,7 +143,7 @@ v0.2 cacheable and attach methods are subsets of GET/HEAD. Arbitrary body-bearin
 Conditions use standard `type`, `status`, `reason`, `message`, `observedGeneration`, and `lastTransitionTime` fields. Expose:
 
 - `Accepted=True/Invalid=False` with reasons Active/Valid only after validated policy generation becomes active.
-- `Accepted=False/Invalid=True` for semantic errors, with reason Conflict, UnknownService, or InvalidOverride.
+- `Accepted=False/Invalid=True` for semantic errors, with reason Conflict, TooManyPolicies, UnknownService, or InvalidOverride. Conflict messages name at most three rivals plus a count. `--max-cache-policies` (default 256) bounds reconciliation work: the oldest policies by creation time, then name, are admitted; the rest get TooManyPolicies without validation or attachment checks.
 - `Accepted=False/Invalid=False` with reason Pending while waiting on activation.
 - `Attached` independently reports route validation. `True` uses reason Attached. `False` uses NoVirtualService, MultipleVirtualServices, MissingSourceBypass, MissingHeaderBypass, MissingCacheRoute, UnrestrictedCacheRoute, or Loop. `Unknown` uses VirtualServicesUnavailable while VirtualServices cannot be listed.
 

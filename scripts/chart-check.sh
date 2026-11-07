@@ -28,6 +28,7 @@ expect 'value: "app.kubernetes.io/instance=catalog-cache,app.kubernetes.io/name=
 expect 'resources: ["cachepolicies/status"]'
 expect 'resources: ["virtualservices"]'
 expect 'kind: CachePolicy'
+expect 'name: STALEWISE_MAX_CACHE_POLICIES'
 if grep -qE 'verbs: .*"(create|delete)"' "$out"; then fail "the Role must not grant writes"; fi
 validate "$out"
 

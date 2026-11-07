@@ -209,6 +209,7 @@ pub fn crd_yaml() -> Result<String, serde_norway::Error> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidReason {
     Conflict,
+    TooManyPolicies,
     UnknownService,
     InvalidOverride,
 }
@@ -217,6 +218,7 @@ impl InvalidReason {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Conflict => "Conflict",
+            Self::TooManyPolicies => "TooManyPolicies",
             Self::UnknownService => "UnknownService",
             Self::InvalidOverride => "InvalidOverride",
         }
@@ -602,15 +604,7 @@ pub fn resolve(candidates: &[Candidate], accepted: &BTreeMap<String, RenderPolic
         .collect();
     for (prefix, names) in &conflicted {
         for name in names.iter() {
-            let others: Vec<&str> = names
-                .iter()
-                .filter(|n| *n != name)
-                .map(String::as_str)
-                .collect();
-            let message = format!(
-                "path prefix {prefix:?} is also claimed by {}",
-                others.join(", ")
-            );
+            let message = conflict_message(prefix, name, names);
             verdicts.insert(
                 name.clone(),
                 Verdict::Invalid(reject(InvalidReason::Conflict, message)),
@@ -630,6 +624,44 @@ pub fn resolve(candidates: &[Candidate], accepted: &BTreeMap<String, RenderPolic
         policies: effective,
         verdicts,
     }
+}
+
+/// Splits policies at `max`, oldest first with ties broken by `age`'s later fields; callers
+/// validate only the admitted ones.
+pub fn admit<T, K: Ord>(mut items: Vec<T>, max: usize, age: impl Fn(&T) -> K) -> (Vec<T>, Vec<T>) {
+    items.sort_by_cached_key(age);
+    let excess = items.split_off(max.min(items.len()));
+    (items, excess)
+}
+
+/// The verdict for a policy past the `--max-cache-policies` budget.
+pub fn over_budget(max: usize) -> Verdict {
+    Verdict::Invalid(reject(
+        InvalidReason::TooManyPolicies,
+        format!("more than {max} CachePolicies reference this Service; older policies win"),
+    ))
+}
+
+/// Rivals named in one conflict diagnostic; the rest are only counted.
+const CONFLICT_NAMES_SHOWN: usize = 3;
+
+/// Names a few rivals plus a count, so diagnostics stay linear in the number of policies.
+fn conflict_message(prefix: &str, name: &str, claimants: &[String]) -> String {
+    let shown: Vec<&str> = claimants
+        .iter()
+        .filter(|n| *n != name)
+        .take(CONFLICT_NAMES_SHOWN)
+        .map(String::as_str)
+        .collect();
+    let hidden = claimants.len().saturating_sub(1 + shown.len());
+    let mut message = format!(
+        "path prefix {prefix:?} is also claimed by {}",
+        shown.join(", ")
+    );
+    if hidden > 0 {
+        message.push_str(&format!(" and {hidden} more"));
+    }
+    message
 }
 
 #[cfg(test)]
@@ -808,6 +840,52 @@ bypass:
                 matches!(&r.verdicts[name], Verdict::Invalid(x) if x.reason == InvalidReason::Conflict)
             );
         }
+    }
+
+    #[test]
+    fn five_thousand_conflicting_policies_get_bounded_diagnostics_quickly() {
+        const COUNT: usize = 5_000;
+        let name = |i: usize| format!("{}-{i:05}", "p".repeat(200));
+        let candidates: Vec<Candidate> = (0..COUNT).map(|i| valid(&name(i), "/api")).collect();
+        let started = std::time::Instant::now();
+        let r = resolve(&candidates, &BTreeMap::new());
+        let elapsed = started.elapsed();
+        let bytes: usize = r
+            .verdicts
+            .values()
+            .map(|v| match v {
+                Verdict::Invalid(x) => {
+                    assert_eq!(x.reason, InvalidReason::Conflict);
+                    assert!(x.message.len() <= 1024, "{} bytes", x.message.len());
+                    x.message.len()
+                }
+                Verdict::Valid => panic!("a conflicting policy stayed valid"),
+            })
+            .sum();
+        assert!(bytes <= COUNT * 1024, "{bytes} diagnostic bytes");
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        assert!(r.policies.is_empty());
+        let sample = &r.verdicts[&name(0)];
+        assert!(
+            matches!(sample, Verdict::Invalid(x) if x.message.contains("and 4996 more")),
+            "{sample:?}"
+        );
+    }
+
+    #[test]
+    fn policy_budget_keeps_the_oldest_and_never_validates_the_excess() {
+        let items: Vec<(u32, String)> = (0..5_000u32).rev().map(|i| (i, format!("p{i}"))).collect();
+        let started = std::time::Instant::now();
+        let (kept, excess) = admit(items, 256, |(age, name)| (*age, name.clone()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(kept.len(), 256);
+        assert_eq!(excess.len(), 4_744);
+        assert!(kept.iter().all(|(age, _)| *age < 256), "the oldest win");
+        let (all, none) = admit(vec![(1, "a")], 256, |p| *p);
+        assert_eq!((all.len(), none.len()), (1, 0));
+        assert!(
+            matches!(over_budget(256), Verdict::Invalid(r) if r.reason == InvalidReason::TooManyPolicies)
+        );
     }
 
     #[test]

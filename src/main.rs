@@ -2,6 +2,8 @@ use std::process::ExitCode;
 
 use stalewise::app::{self, EXIT_CONFIG, EXIT_RUNTIME};
 use stalewise::config::Startup;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 fn main() -> ExitCode {
     let config = match stalewise::config::load() {
@@ -12,16 +14,19 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONFIG);
         }
     };
-    let filter = match tracing_subscriber::EnvFilter::try_new(&config.log_level) {
+    let filter = match config
+        .log_level
+        .parse::<tracing_subscriber::filter::Targets>()
+    {
         Ok(filter) => filter,
         Err(err) => {
             eprintln!("stalewise: invalid --log-level: {err}");
             return ExitCode::from(EXIT_CONFIG);
         }
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(filter)
         .init();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

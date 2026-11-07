@@ -373,6 +373,7 @@ enum Rejection {
     Timeout,
     QueueFull,
     HistoryFull,
+    NoEntropy,
 }
 
 impl Rejection {
@@ -386,6 +387,7 @@ impl Rejection {
             Self::Timeout => (StatusCode::REQUEST_TIMEOUT, "body read timed out\n"),
             Self::QueueFull => (StatusCode::SERVICE_UNAVAILABLE, "queue full\n"),
             Self::HistoryFull => (StatusCode::SERVICE_UNAVAILABLE, "history full\n"),
+            Self::NoEntropy => (StatusCode::SERVICE_UNAVAILABLE, "entropy unavailable\n"),
         };
         let mut response = http::text(status, body);
         let headers = response.headers_mut();
@@ -598,7 +600,7 @@ fn enqueue(
     request: Arc<Invalidation>,
     targets: &[Target],
 ) -> Result<Status, Rejection> {
-    let id = InvalidationId::random();
+    let id = InvalidationId::random().map_err(|_| Rejection::NoEntropy)?;
     let status = pending_status(id, &intake.config.pod_name, targets);
     let mut history = intake.ledger.lock();
     let victims = history.plan(targets.len()).ok_or(Rejection::HistoryFull)?;
@@ -735,7 +737,7 @@ async fn deliver(
             .saturating_mul(2u64.saturating_pow(attempt))
             .min(RETRY_CAP_MS);
         attempt = attempt.saturating_add(1);
-        let pause = Duration::from_millis(rand::random_range(RETRY_BASE_MS..=ceiling));
+        let pause = Duration::from_millis(crate::entropy::jitter(RETRY_BASE_MS..=ceiling));
         tokio::time::sleep_until((Instant::now() + pause).min(delivery.deadline)).await;
     }
 }
@@ -1335,7 +1337,7 @@ mod tests {
         });
         let delivery = Delivery {
             request,
-            id: InvalidationId::random(),
+            id: InvalidationId::random().unwrap(),
             slot: 0,
             peer: "127.0.0.1:9".parse().unwrap(),
             authority: HeaderValue::from_static("a"),

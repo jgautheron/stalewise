@@ -6,6 +6,7 @@ pub mod config;
 pub mod controller;
 pub mod discovery;
 pub mod endpoint;
+pub mod entropy;
 pub mod http;
 pub mod ledger;
 pub mod membership;

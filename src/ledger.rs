@@ -14,8 +14,9 @@ use tokio::time::Instant;
 pub struct InvalidationId(u128);
 
 impl InvalidationId {
-    pub fn random() -> Self {
-        Self(rand::random())
+    /// Fails only when the OS CSPRNG is unavailable.
+    pub fn random() -> Result<Self, crate::entropy::Error> {
+        crate::entropy::bytes().map(|b| Self(u128::from_le_bytes(b)))
     }
 }
 
@@ -258,7 +259,7 @@ mod tests {
 
     fn admit(h: &mut History, n: usize) -> Option<InvalidationId> {
         let victims = h.plan(n)?;
-        let id = InvalidationId::random();
+        let id = InvalidationId::random().unwrap();
         h.insert(
             &victims,
             pending_status(id, "cache-0", &targets(n)),
@@ -275,7 +276,7 @@ mod tests {
 
     #[test]
     fn ids_are_32_lowercase_hex_and_round_trip() {
-        let id = InvalidationId::random();
+        let id = InvalidationId::random().unwrap();
         let text = id.to_string();
         assert_eq!(text.len(), 32);
         assert_eq!(text.parse::<InvalidationId>(), Ok(id));

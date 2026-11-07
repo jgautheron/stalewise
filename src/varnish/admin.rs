@@ -55,7 +55,7 @@ pub const OWNED_PREFIX: &str = "stalewise_";
 impl VclName {
     /// A fresh owned name: monotonic sequence plus random suffix.
     pub fn generate(sequence: u64) -> Self {
-        let suffix: u32 = rand::random();
+        let suffix = crate::entropy::weak_u64() as u32;
         Self(format!("{OWNED_PREFIX}{sequence}_{suffix:08x}"))
     }
 

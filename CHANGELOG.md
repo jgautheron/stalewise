@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 0.3.0 is the first tagged release.
 The 0.1.0 and 0.2.0 sections describe untagged development milestones whose changes ship in 0.3.0.
 
+## [Unreleased]
+
+### Changed
+
+- `--log-level` accepts a level or comma-separated `target=level` directives; span and field filters are no longer accepted and fail startup.
+- Log lines and CLI help no longer contain ANSI color codes, and mistyped flags no longer get spelling suggestions.
+- The signaller answers 503 `entropy unavailable` when the OS random source fails instead of panicking.
+
 ## [0.3.0] - 2026-11-07
 
 ### Added

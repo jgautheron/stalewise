@@ -90,7 +90,8 @@ fn admin_secret(config: &Config, output: &OutputDir) -> Result<PathBuf, StartupE
         }
         return Ok(path.clone());
     }
-    let raw: [u8; 32] = rand::random();
+    let raw: [u8; 32] = crate::entropy::bytes()
+        .map_err(|e| StartupError::Runtime(format!("cannot generate admin secret: {e}")))?;
     let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
     output
         .publish(SECRET_FILE, hex.as_bytes())

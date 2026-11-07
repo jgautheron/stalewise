@@ -348,7 +348,7 @@ impl OutputDir {
                 reason: "file name must be a plain relative name",
             });
         }
-        let suffix: u64 = rand::random();
+        let suffix = crate::entropy::weak_u64();
         let tmp = c_name(&format!(".{file_name}.{suffix:016x}.tmp"))?;
         let target = c_name(file_name)?;
         let dir = self.fd.as_raw_fd();

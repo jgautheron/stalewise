@@ -182,7 +182,7 @@ impl Backoff {
             .saturating_mul(2u64.saturating_pow(self.attempt))
             .min(BACKOFF_CAP_MS);
         self.attempt = self.attempt.saturating_add(1);
-        Duration::from_millis(rand::random_range(BACKOFF_BASE_MS..=ceiling))
+        Duration::from_millis(crate::entropy::jitter(BACKOFF_BASE_MS..=ceiling))
     }
 
     pub fn reset(&mut self) {

@@ -721,6 +721,12 @@ fn ttl_policies() -> Vec<stalewise::policy::RenderPolicy> {
             "{ttlSeconds: 60, cookies: {mode: stripListed, names: [analytics]}}\nbypass: [{header: {name: X-Preview, exact: \"true\"}}]",
         ),
         ("query", "/q", "{ttlSeconds: 60, key: {queryAllowList: [page]}}"),
+        ("asset", "/asset", "{ttlSeconds: 60, key: {queryAllowList: []}}"),
+        (
+            "tenant",
+            "/tenant",
+            "{ttlSeconds: 60, cacheableMethods: [HEAD], key: {headers: [X-Tenant]}}\nbypass: [{header: {name: X-Preview, exact: \"true\"}}]",
+        ),
         ("private", "/private", "{ttlSeconds: 60}"),
         ("cache", "/cache", "{ttlSeconds: 0}"),
     ]
@@ -1683,5 +1689,48 @@ async fn transient_storage_is_bounded_by_default() {
     assert!(
         (1..=64 << 20).contains(&space),
         "Transient must have a finite 64MiB budget: {space}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn purge_uses_the_policy_cache_key_and_skips_bypass_and_method_rules() {
+    let (port, origin) = start_origin().await;
+    let dir = temp_dir("policy-purge");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    std::fs::write(dir.join("template.vcl"), rendered_policy_vcl(port)).unwrap();
+    let mut args = base_args(port);
+    args.push("--template=/config/template.vcl".into());
+    let c = run_cache(&dir, &args).await;
+    warm(c.traffic).await;
+    let auth = format!("Authorization: Bearer {TOKEN}\r\n");
+    let purge = async |path: &str, extra: &str| {
+        let headers = format!("{auth}X-Stalewise-Wait: 5s\r\n{extra}");
+        let reply = request(c.signaller, "PURGE", path, &headers).await;
+        assert!(reply.status < 300, "purge {path}: {}", reply.status);
+    };
+
+    request(c.traffic, "GET", "/asset?tracking=x", "").await;
+    assert!(
+        request(c.traffic, "GET", "/asset?tracking=x", "")
+            .await
+            .is_hit()
+    );
+    purge("/asset?tracking=x", "").await;
+    assert!(
+        !request(c.traffic, "GET", "/asset?tracking=x", "")
+            .await
+            .is_hit(),
+        "the purge used the normalised key"
+    );
+    assert_eq!(hits(&origin, "/asset"), 2);
+
+    let tenant = "X-Tenant: a\r\n";
+    request(c.traffic, "HEAD", "/tenant", tenant).await;
+    assert!(request(c.traffic, "HEAD", "/tenant", tenant).await.is_hit());
+    purge("/tenant", &format!("{tenant}X-Preview: true\r\n")).await;
+    assert!(
+        !request(c.traffic, "HEAD", "/tenant", tenant).await.is_hit(),
+        "header-keyed objects purge despite bypass and method rules"
     );
 }

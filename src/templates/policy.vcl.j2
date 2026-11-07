@@ -187,8 +187,8 @@ sub stalewise_clear_request {
     unset req.http.X-Stalewise-Peer-Tags;
 }
 
-# CachePolicies, most specific prefix first; bypass rules win before any lookup.
-sub stalewise_policy_request {
+# Selects the most specific CachePolicy; reads and PURGE share it.
+sub stalewise_policy_match {
     unset req.http.X-Stalewise-Policy;
     unset req.http.X-Stalewise-Key-Url;
 {% for p in policies %}
@@ -198,6 +198,31 @@ sub stalewise_policy_request {
 {% if policies %}
     }
 {% endif %}
+}
+
+# Policy cache-key normalisation without side effects; vcl_hash adds the policy's key headers.
+sub stalewise_policy_key {
+{% for p in policies %}
+{% if p.query_allow is not none %}
+    if (req.http.X-Stalewise-Policy == "{{ p.id }}") {
+{% if p.query_allow %}
+        if (req.url ~ "\?") {
+            set req.http.X-Stalewise-Key-Url = regsuball("&" + regsub(req.url, "^[^?]*\?", ""),
+                "&(?!(?:{{ p.query_allow | join("|") }})(?:=|&|$))[^&]*", "");
+            set req.http.X-Stalewise-Key-Url = regsub(req.url, "\?.*$", "") +
+                regsub(req.http.X-Stalewise-Key-Url, "^&", "?");
+        }
+{% else %}
+        set req.http.X-Stalewise-Key-Url = regsub(req.url, "\?.*$", "");
+{% endif %}
+    }
+{% endif %}
+{% endfor %}
+}
+
+# Bypass and method rules win before any lookup.
+sub stalewise_policy_request {
+    call stalewise_policy_match;
 {% for p in policies %}
     if (req.http.X-Stalewise-Policy == "{{ p.id }}") {
 {% for b in p.bypass_paths %}
@@ -224,20 +249,9 @@ sub stalewise_policy_request {
             }
         }
 {% endif %}
-{% if p.query_allow is not none %}
-{% if p.query_allow %}
-        if (req.url ~ "\?") {
-            set req.http.X-Stalewise-Key-Url = regsuball("&" + regsub(req.url, "^[^?]*\?", ""),
-                "&(?!(?:{{ p.query_allow | join("|") }})(?:=|&|$))[^&]*", "");
-            set req.http.X-Stalewise-Key-Url = regsub(req.url, "\?.*$", "") +
-                regsub(req.http.X-Stalewise-Key-Url, "^&", "?");
-        }
-{% else %}
-        set req.http.X-Stalewise-Key-Url = regsub(req.url, "\?.*$", "");
-{% endif %}
-{% endif %}
     }
 {% endfor %}
+    call stalewise_policy_key;
 }
 
 sub stalewise_policy_response {
@@ -307,6 +321,8 @@ sub vcl_recv {
         if (client.ip !~ stalewise_purgers) {
             return (synth(403, "Forbidden"));
         }
+        call stalewise_policy_match;
+        call stalewise_policy_key;
         return (purge);
     }
     if (req.method == "BAN") {

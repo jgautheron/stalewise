@@ -86,7 +86,7 @@ Store the union of Surrogate-Key and Cache-Tag response tokens in internal objec
 
 A BAN request supplies exactly one `X-Stalewise-Tag` token. The signaller validates it before queue admission; each default VCL validates it again at its separate public boundary. BAN without a valid tag returns 400. Bodies are never interpreted as executable ban expressions.
 
-Construct a fixed host-equality plus token-boundary tag expression with `std.ban`. PURGE continues to invalidate authority+URL. Host validation and token restrictions prevent expression injection. Strip internal metadata, Surrogate-Key, and Cache-Tag before delivery. Never let one authority invalidate another authority's objects.
+Construct a fixed host-equality plus token-boundary tag expression with `std.ban`. PURGE invalidates the same key a read uses: authority, policy-normalized URL, and policy key headers. Reads and PURGE share one side-effect-free key subroutine, and PURGE never runs bypass or method rules, which could return pass. Host validation and token restrictions prevent expression injection. Strip internal metadata, Surrogate-Key, and Cache-Tag before delivery. Never let one authority invalidate another authority's objects.
 
 ### v0.2 schema contract
 

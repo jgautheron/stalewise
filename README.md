@@ -143,6 +143,8 @@ Pass the cache pods' labels with `--cache-source-labels` so the check can match 
 Enable the signaller with `--signaller`, `--signaller-token-file`, `--pod-ip` and `--pod-name`.
 On a dual-stack pod, pass every pod address to `--pod-ip` as a comma-separated list.
 Callers send `PURGE` for one URL, or `BAN` with exactly one `X-Stalewise-Tag` header, to port 8081 with `Authorization: Bearer <token>`.
+`PURGE` computes the same cache key as a read: a CachePolicy's query allow-list and key headers apply, so send the URL and key headers a client would send.
+Bypass and method rules never apply to `PURGE`.
 A `202 Accepted` response means the request is queued in memory, not that every peer purged it.
 
 Each accepted write returns a JSON status, `Location: /invalidations/<id>` and `X-Stalewise-Pod`.

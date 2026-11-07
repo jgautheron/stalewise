@@ -23,6 +23,8 @@ pub struct Behavior {
     pub lose_reply_on: Option<&'static str>,
     /// Fails `vcl.discard` with a command error.
     pub fail_discard: bool,
+    /// Fails every `vcl.use` with a command error, leaving the active VCL unchanged.
+    pub reject_use: bool,
 }
 
 #[derive(Debug)]
@@ -194,6 +196,7 @@ fn apply(text: &str, behavior: &Behavior, state: &Mutex<State>) -> (u16, String)
             st.vcls.push(Vcl { name, source });
             (200, "VCL compiled.".into())
         }
+        "vcl.use" if behavior.reject_use => (106, "VCL cannot be activated".into()),
         "vcl.use" if st.vcls.iter().any(|v| v.name == name) => {
             st.active = name.clone();
             (200, format!("VCL '{name}' now active"))

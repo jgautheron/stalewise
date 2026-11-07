@@ -275,6 +275,7 @@ impl Reloader {
         if self.active().is_some_and(|a| *a.bytes == *bytes) {
             self.metrics.reload_skips.inc();
             self.health.set(Reason::CompileFailed, false);
+            self.health.set(Reason::ActivationRejected, false);
             return self.retry_cleanup().await;
         }
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
@@ -343,8 +344,13 @@ impl Reloader {
             Ok(()) => client.list().await,
             Err(_) => self.relist().await,
         };
+        let rejected = matches!(used, Err(AdminError::Command { .. }));
         match confirmed.as_ref().ok().and_then(|l| active_name(l)) {
             Some(active) if *active == name => self.commit(name, bytes).await,
+            Some(_) if rejected => {
+                self.last_failed = Some(digest);
+                self.fail(Reason::ActivationRejected, false);
+            }
             Some(_) => self.fail(Reason::AdminUnavailable, true),
             None => {
                 tracing::warn!("active VCL unknown after activation; deferring cleanup");
@@ -389,7 +395,11 @@ impl Reloader {
         self.metrics.reload_successes.inc();
         self.backoff.reset();
         self.last_failed = None;
-        for reason in [Reason::CompileFailed, Reason::AdminUnavailable] {
+        for reason in [
+            Reason::CompileFailed,
+            Reason::ActivationRejected,
+            Reason::AdminUnavailable,
+        ] {
             self.health.set(reason, false);
         }
         self.state.send_replace(Some(Active {
@@ -668,6 +678,27 @@ mod tests {
             1,
             "no blind replay"
         );
+        h.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn rejected_activation_is_not_retried_for_the_same_bytes() {
+        let h = start(
+            Behavior {
+                reject_use: true,
+                ..Behavior::default()
+            },
+            5,
+        )
+        .await;
+        h.backends.send_replace(snapshot(&["10.0.0.4"]));
+        eventually(|| h.health.current().contains(&Reason::ActivationRejected)).await;
+        assert!(!h.health.current().contains(&Reason::AdminUnavailable));
+        let loads = h.fake.state.lock().unwrap().inline_count;
+        h.backends.send_replace(snapshot(&["10.0.0.4"]));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(h.fake.state.lock().unwrap().inline_count, loads);
+        assert_eq!(h.fake.active(), "boot");
         h.stop.cancel();
     }
 

@@ -341,7 +341,7 @@ impl Config {
             work_dir: cli.work_dir,
             varnish_work_dir: cli.varnish_work_dir,
             varnish_bin: cli.varnish_bin,
-            listen: cli.listen,
+            listen: frontend_listen(cli.listen)?,
             admin_listen: loopback("--admin-listen", cli.admin_listen)?,
             admin_secret_file: cli.admin_secret_file,
             admin_timeout: positive("--admin-timeout", cli.admin_timeout)?,
@@ -524,6 +524,19 @@ fn loopback(flag: &'static str, addr: SocketAddr) -> Result<SocketAddr, ConfigEr
         Ok(addr)
     } else {
         Err(invalid(flag, "must be a loopback address with a port"))
+    }
+}
+
+/// The readiness probe dials loopback, which only a wildcard or loopback bind answers.
+fn frontend_listen(addr: SocketAddr) -> Result<SocketAddr, ConfigError> {
+    let ip = addr.ip();
+    if (ip.is_unspecified() || ip.is_loopback()) && addr.port() != 0 {
+        Ok(addr)
+    } else {
+        Err(invalid(
+            "--listen",
+            "must be a wildcard or loopback address with a port",
+        ))
     }
 }
 
@@ -714,6 +727,8 @@ mod tests {
         for extra in [
             "--purge-acl=10.0.0.0/40",
             "--admin-listen=0.0.0.0:6082",
+            "--listen=10.0.0.5:8080",
+            "--listen=[2001:db8::5]:8080",
             "--max-vcls=0",
             "--template-poll=0s",
             "--backend-probe-path=/a\"b",
@@ -752,6 +767,16 @@ mod tests {
         assert_eq!(cfg.purge_acl.len(), 3);
         assert_eq!(cfg.template_env.len(), 1);
         assert_eq!(cfg.varnish_params.len(), 2);
+    }
+
+    #[test]
+    fn listen_accepts_wildcards_and_loopback_the_probe_can_reach() {
+        for listen in ["0.0.0.0:8080", "[::]:8080", "127.0.0.1:8080", "[::1]:8080"] {
+            let mut args = BASE.to_vec();
+            let flag = format!("--listen={listen}");
+            args.push(&flag);
+            assert!(parse(&args).is_ok(), "{listen}");
+        }
     }
 
     #[test]

@@ -76,7 +76,7 @@ CLI overrides environment, then profile defaults. List-valued flags are comma-se
 | `--work-dir` | `STALEWISE_WORK_DIR` | /var/lib/stalewise |
 | `--varnish-work-dir` | `STALEWISE_VARNISH_WORK_DIR` | /var/lib/varnish |
 | `--varnish-bin` | `STALEWISE_VARNISH_BIN` | varnishd |
-| `--listen` | `STALEWISE_LISTEN` | 0.0.0.0:8080 |
+| `--listen` | `STALEWISE_LISTEN` | 0.0.0.0:8080; wildcard or loopback only |
 | `--admin-listen` | `STALEWISE_ADMIN_LISTEN` | 127.0.0.1:6082 |
 | `--admin-secret-file` | `STALEWISE_ADMIN_SECRET_FILE` | generated work-dir/admin.secret |
 | `--admin-timeout` | `STALEWISE_ADMIN_TIMEOUT` | 5s |

@@ -261,6 +261,7 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         process: process_rx.clone(),
         probe: probe_rx,
         health: shared.health.clone(),
+        draining: root.clone(),
     };
     let management = ManagementConfig {
         listen: config.management_listen,
@@ -270,7 +271,8 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         management,
         status,
         Arc::clone(&shared.metrics),
-        root.clone(),
+        // Outlives `root` so /readyz can report draining until the process exits.
+        CancellationToken::new(),
     ));
 
     let mut tasks = Background::default();
@@ -329,7 +331,9 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         work_dir: config.varnish_work_dir.clone(),
         params: config.varnish_params.clone(),
         startup_timeout: config.startup_timeout,
-        shutdown_timeout: config.shutdown_timeout.saturating_sub(drain_budget),
+        shutdown_timeout: config
+            .shutdown_timeout
+            .saturating_sub(drain_budget.max(config.drain_delay)),
     };
     let child_stop = CancellationToken::new();
     let mut child = tokio::spawn(process::supervise(
@@ -379,8 +383,16 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         let _ = tokio::time::timeout(config.shutdown_timeout, child).await;
         return Ok(ExitCode::from(EXIT_RUNTIME));
     }
-    let _ = tokio::time::timeout(drain_budget, signal_task).await;
-    child_stop.cancel();
+    let signaller = async {
+        let _ = tokio::time::timeout(drain_budget, signal_task).await;
+    };
+    tokio::select! {
+        () = drain_then_stop(config.drain_delay, signaller, &child_stop) => {}
+        result = &mut child => {
+            tracing::error!(reason = %describe_child(result), "varnishd died while draining");
+            return Ok(ExitCode::from(EXIT_RUNTIME));
+        }
+    }
     match child.await {
         Ok(Ok(status)) => {
             tracing::info!(status = %status, "varnishd reaped; exiting");
@@ -391,6 +403,21 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
             Ok(ExitCode::from(EXIT_RUNTIME))
         }
     }
+}
+
+/// Keeps varnishd serving for `delay` (and the signaller drain) so endpoint removal propagates
+/// before connections close, then asks it to stop.
+async fn drain_then_stop(
+    delay: Duration,
+    signaller: impl Future<Output = ()>,
+    child_stop: &CancellationToken,
+) {
+    tracing::info!(
+        delay_ms = delay.as_millis(),
+        "draining; readiness reports not ready"
+    );
+    tokio::join!(tokio::time::sleep(delay), signaller);
+    child_stop.cancel();
 }
 
 fn spawn_signaller(
@@ -437,5 +464,35 @@ mod tests {
         tasks.spawn("reloader", async { panic!("boom") });
         let reason = tasks.first_exit().await;
         assert!(reason.starts_with("reloader failed"), "{reason}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_draining_but_keeps_varnishd_up_for_the_delay() {
+        let root = CancellationToken::new();
+        let (_process, process) = watch::channel(ProcessState::Running);
+        let (_active, active) = watch::channel(None);
+        let (_probe, probe) = watch::channel(Some(tokio::time::Instant::now()));
+        let inputs = StatusInputs {
+            active,
+            process,
+            probe,
+            health: Health::new(Arc::new(Metrics::new())),
+            draining: root.clone(),
+        };
+        let child_stop = CancellationToken::new();
+        root.cancel();
+        let delay = Duration::from_secs(10);
+        let drain = tokio::spawn({
+            let child_stop = child_stop.clone();
+            async move { drain_then_stop(delay, async {}, &child_stop).await }
+        });
+        assert_eq!(
+            mgmt::readiness(&inputs),
+            mgmt::Readiness::NotReady { reason: "draining" }
+        );
+        tokio::time::sleep(delay - Duration::from_millis(1)).await;
+        assert!(!child_stop.is_cancelled());
+        drain.await.unwrap();
+        assert!(child_stop.is_cancelled());
     }
 }

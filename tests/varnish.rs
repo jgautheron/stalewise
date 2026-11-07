@@ -519,6 +519,37 @@ async fn generic_profile_caches_purges_reloads_and_serves_stale() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker; CI runs it"]
+async fn sigterm_reports_draining_keeps_serving_for_the_delay_then_exits_zero() {
+    let (port, _origin) = start_origin().await;
+    let dir = temp_dir("drain");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let delay = Duration::from_secs(4);
+    let mut args = base_args(port);
+    args.push(format!("--drain-delay={}s", delay.as_secs()));
+    let c = run_cache(&dir, &args).await;
+    warm(c.traffic).await;
+
+    docker(&["kill", "--signal", "TERM", &c.id]);
+    let signalled = Instant::now();
+    let readyz = request(c.management, "GET", "/readyz", "").await;
+    assert!(signalled.elapsed() < Duration::from_secs(1));
+    assert_eq!(readyz.status, 503, "{}", readyz.body);
+    assert!(readyz.body.contains("draining"), "{}", readyz.body);
+    while signalled.elapsed() < delay - Duration::from_millis(500) {
+        let reply = request(c.traffic, "GET", "/cache", "").await;
+        assert_eq!(reply.status, 200, "traffic served while draining");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let exit = docker(&["wait", &c.id]);
+    assert!(
+        signalled.elapsed() >= delay,
+        "varnishd outlived the drain delay"
+    );
+    assert_eq!(exit, "0", "drained shutdown exits zero: {}", logs(&c.id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
 async fn mesh_profile_rewrites_authority_and_child_death_is_fatal() {
     let (port, origin) = start_origin().await;
     let dir = temp_dir("mesh");

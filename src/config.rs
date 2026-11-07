@@ -184,6 +184,9 @@ pub struct Cli {
     pub startup_timeout: Duration,
     #[arg(long, env = "STALEWISE_SHUTDOWN_TIMEOUT", value_parser = parse_duration, default_value = "30s")]
     pub shutdown_timeout: Duration,
+    /// Time between SIGTERM and stopping varnishd while /readyz reports draining; 0 disables.
+    #[arg(long, env = "STALEWISE_DRAIN_DELAY", value_parser = parse_duration, default_value = "10s")]
+    pub drain_delay: Duration,
     #[arg(
         long,
         env = "STALEWISE_MANAGEMENT_LISTEN",
@@ -394,6 +397,8 @@ pub struct Config {
     pub max_vcls: usize,
     pub startup_timeout: Duration,
     pub shutdown_timeout: Duration,
+    /// Part of `shutdown_timeout`, always strictly smaller.
+    pub drain_delay: Duration,
     pub management_listen: SocketAddr,
     pub probe_listen: SocketAddr,
     pub signaller: Option<SignalConfig>,
@@ -606,6 +611,7 @@ impl Config {
             max_vcls: at_least_one("--max-vcls", cli.max_vcls)?,
             startup_timeout: positive("--startup-timeout", cli.startup_timeout)?,
             shutdown_timeout: positive("--shutdown-timeout", cli.shutdown_timeout)?,
+            drain_delay: drain_delay(cli.drain_delay, cli.shutdown_timeout)?,
             management_listen: cli.management_listen,
             probe_listen: distinct_probe(cli.probe_listen, cli.management_listen)?,
             signaller,
@@ -629,6 +635,16 @@ impl Config {
             log_level: cli.log_level,
         })
     }
+}
+
+fn drain_delay(delay: Duration, shutdown: Duration) -> Result<Duration, ConfigError> {
+    if delay >= shutdown {
+        return Err(invalid(
+            "--drain-delay",
+            "must be shorter than --shutdown-timeout, which bounds the whole shutdown",
+        ));
+    }
+    Ok(delay)
 }
 
 fn policy_config(
@@ -1074,6 +1090,18 @@ mod tests {
         let acl: Vec<String> = cfg.purge_acl.iter().map(ToString::to_string).collect();
         assert_eq!(acl, ["127.0.0.1/32", "::1/128"]);
         assert!(cfg.signaller.is_none());
+    }
+
+    #[test]
+    fn drain_delay_must_fit_inside_the_shutdown_timeout() {
+        let with = |extra: &[&str]| parse(&[&BASE[..], extra].concat());
+        assert_eq!(with(&[]).unwrap().drain_delay, Duration::from_secs(10));
+        assert_eq!(
+            with(&["--drain-delay=0s"]).unwrap().drain_delay,
+            Duration::ZERO
+        );
+        assert!(with(&["--drain-delay=30s"]).is_err());
+        assert!(with(&["--drain-delay=5s", "--shutdown-timeout=5s"]).is_err());
     }
 
     #[test]

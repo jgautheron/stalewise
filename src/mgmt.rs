@@ -39,6 +39,8 @@ pub struct StatusInputs {
     pub process: watch::Receiver<ProcessState>,
     pub probe: watch::Receiver<Option<Instant>>,
     pub health: Health,
+    /// Cancelled at shutdown request; readiness drops while traffic is still served.
+    pub draining: CancellationToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +51,9 @@ pub enum Readiness {
 
 /// 503 only without an active VCL or a fresh local probe; degradation never removes traffic.
 pub fn readiness(inputs: &StatusInputs) -> Readiness {
+    if inputs.draining.is_cancelled() {
+        return Readiness::NotReady { reason: "draining" };
+    }
     if *inputs.process.borrow() != ProcessState::Running {
         return Readiness::NotReady {
             reason: "varnishd is not running",
@@ -254,6 +259,7 @@ mod tests {
                 process: process_rx,
                 probe: probe_rx,
                 health,
+                draining: CancellationToken::new(),
             },
             active,
             process,

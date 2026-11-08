@@ -19,8 +19,10 @@ acl stalewise_peers {
 }
 
 # Restores the original authority on trusted forwards; malformed or duplicated fields are refused.
+# Refusals are marked so a forwarder whose membership is ahead of ours falls back to the origin.
 sub stalewise_peer_request {
     if (req.http.X-Stalewise-Shard-Hop) {
+        set req.http.X-Stalewise-Hop-Refused = "1";
         if (client.ip !~ stalewise_peers) {
             return (synth(403, "Forbidden"));
         }
@@ -31,6 +33,7 @@ sub stalewise_peer_request {
             req.http.X-Stalewise-Host !~ "^([a-z0-9_.-]+|\[[0-9a-f:.]+\])(:[0-9]{1,5})?$") {
             return (synth(400, "Bad Request"));
         }
+        unset req.http.X-Stalewise-Hop-Refused;
         set req.http.X-Stalewise-Peer = req.http.X-Stalewise-Host;
         unset req.http.X-Stalewise-Host;
     }
@@ -185,6 +188,7 @@ sub stalewise_clear_request {
     unset req.http.X-Stalewise-Shard-Key;
     unset req.http.X-Stalewise-Peer-Ttl;
     unset req.http.X-Stalewise-Peer-Tags;
+    unset req.http.X-Stalewise-Hop-Refused;
 }
 
 # Selects the most specific CachePolicy; reads and PURGE share it.
@@ -446,6 +450,11 @@ sub vcl_synth {
         set req.hash_always_miss = false;
         return (restart);
     }
+{% if shard %}
+    if (req.http.X-Stalewise-Hop-Refused) {
+        set resp.http.X-Stalewise-Hop-Refused = "1";
+    }
+{% endif %}
 }
 
 sub vcl_backend_fetch {
@@ -646,13 +655,15 @@ sub stalewise_tags {
 sub vcl_backend_response {
 {% if shard and shard.peers %}
     if (bereq.http.X-Stalewise-Shard-Hop) {
-        if (bereq.retries == 0 && beresp.status >= 500) {
+        if (bereq.retries == 0 &&
+            (beresp.status >= 500 || beresp.http.X-Stalewise-Hop-Refused)) {
             return (retry);
         }
         call stalewise_peer_response;
     }
 {% endif %}
     call stalewise_clear_response;
+    unset beresp.http.X-Stalewise-Hop-Refused;
     unset beresp.http.X-Stalewise-Peer-Ttl;
     unset beresp.http.X-Stalewise-Peer-Tags;
     if ((bereq.is_bgfetch || bereq.http.X-Stalewise-Refetch) && beresp.status >= 500) {
@@ -709,6 +720,7 @@ sub vcl_backend_error {
 }
 
 sub vcl_deliver {
+    unset resp.http.X-Stalewise-Hop-Refused;
     unset resp.http.X-Stalewise-Peer-Ttl;
     unset resp.http.X-Stalewise-Peer-Tags;
 {% if shard %}

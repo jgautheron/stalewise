@@ -47,6 +47,9 @@ fn route(path: &str, n: usize) -> (StatusCode, Vec<(&'static str, String)>, Stri
         headers.push(("surrogate-key", "gamma".into()));
         return (StatusCode::OK, headers, body);
     }
+    if path.starts_with("/deny/") {
+        return (StatusCode::FORBIDDEN, vec![], body);
+    }
     match path {
         "/spoofed" => (
             StatusCode::OK,
@@ -894,6 +897,18 @@ async fn three_sharded_caches_fill_once_forward_one_hop_and_fall_back_to_origin(
         );
     }
 
+    for i in 0..6 {
+        let key = format!("/deny/{i}");
+        let reply = request(traffic[0], "GET", &key, "").await;
+        assert_eq!(reply.status, 403, "{key}: an origin 403 is delivered as-is");
+        assert!(!reply.headers.keys().any(|k| k.starts_with("x-stalewise")));
+        assert_eq!(
+            hits(origin, &key),
+            1,
+            "{key}: an origin 403 is never retried"
+        );
+    }
+
     for addr in &traffic {
         let spoofed = request(*addr, "GET", "/spoofed", "").await;
         assert!(!spoofed.headers.keys().any(|k| k.starts_with("x-stalewise")));
@@ -1042,6 +1057,73 @@ async fn three_sharded_caches_fill_once_forward_one_hop_and_fall_back_to_origin(
         degraded.body
     );
     eprintln!("fills: fallback keys {fallbacks}/18 counts {counts:?}");
+}
+
+/// Two shards whose memberships disagree: A rings both pods, B rings and trusts only itself.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn owner_refusing_an_untrusted_hop_falls_back_to_the_origin() {
+    let (port, origin) = start_origin().await;
+    let prefix = "10.213.80";
+    let (ip_a, ip_b) = (format!("{prefix}.10"), format!("{prefix}.11"));
+    let full = start_fake_kube(&[&ip_a, &ip_b]).await;
+    let lagging = start_fake_kube(&[&ip_b]).await;
+    let net = format!("stalewise-it-skew-{}", std::process::id());
+    docker(&[
+        "network",
+        "create",
+        "--subnet",
+        &format!("{prefix}.0/24"),
+        &net,
+    ]);
+    let network = Network(net);
+    let mut nodes = Vec::new();
+    for (ip, pod, kube) in [(&ip_a, "cache-0", full), (&ip_b, "cache-0", lagging)] {
+        let dir = temp_dir(&format!("skew-{pod}-{kube}"));
+        std::fs::write(dir.join("token"), TOKEN).unwrap();
+        std::fs::write(dir.join("kubeconfig"), kubeconfig(kube)).unwrap();
+        let mut args = peer_args(port, ip, pod);
+        args.extend(
+            [
+                "--shard",
+                "--peer-timeout=1s",
+                "--membership-debounce=100ms",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned()),
+        );
+        nodes.push(run_peer_with(&dir, &network.0, ip, args).await);
+    }
+    for (c, size) in nodes.iter().zip([2, 1]) {
+        wait_for("skewed rings", Duration::from_secs(60), async || {
+            ring_size(c) == size
+        })
+        .await;
+        warm(c.traffic).await;
+    }
+    let keys: Vec<String> = (0..12).map(|i| format!("/shard/skew{i}")).collect();
+    for key in &keys {
+        let reply = request(nodes[0].traffic, "GET", key, "").await;
+        assert_eq!(
+            reply.status, 200,
+            "{key}: a refused hop falls back to the origin"
+        );
+        assert!(!reply.headers.keys().any(|k| k.starts_with("x-stalewise")));
+    }
+    let counts: Vec<usize> = keys.iter().map(|k| hits(&origin, k)).collect();
+    assert!(counts.iter().all(|n| *n == 1), "{counts:?}");
+    let forged = request(
+        nodes[1].traffic,
+        "GET",
+        "/shard/forged",
+        "X-Stalewise-Shard-Hop: 1\r\nX-Stalewise-Host: catalog.test\r\n",
+    )
+    .await;
+    assert_eq!(
+        forged.status, 403,
+        "a non-peer still cannot send hop headers"
+    );
+    assert_eq!(hits(&origin, "/shard/forged"), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

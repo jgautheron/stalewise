@@ -24,6 +24,7 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 
 ### Fixed
 
+- With `--shard`, an owner that does not yet trust a forwarding peer no longer makes the client receive 403. Memberships briefly disagree at startup, on scale-up and during rollouts. The owner now marks hop refusals, and the forwarder retries once directly against the origin, as it already did for a peer 5xx. A 403 from the origin is still delivered unchanged.
 - `kubectl rollout restart` no longer resets client connections. On SIGTERM, `/readyz` answers 503 `draining`, the signaller stops admitting, and Varnish keeps serving for `--drain-delay` (`STALEWISE_DRAIN_DELAY`, default `10s`, `0` disables) before it stops. The delay counts against `--shutdown-timeout` and must be shorter than it.
 - The chart adds `drainDelay` (10) and `shutdownTimeout` (30) and renders `terminationGracePeriodSeconds` as at least `drainDelay + shutdownTimeout + 5`. `values-mesh.yaml` sets the Istio `terminationDrainDuration` so the sidecar outlives the drain.
 

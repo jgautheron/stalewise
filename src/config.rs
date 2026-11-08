@@ -176,6 +176,10 @@ pub struct Cli {
         default_value = "malloc,64m"
     )]
     pub transient_storage: String,
+    /// Bytes an uncacheable fetch may read ahead of its client; 0 is unlimited and lets a slow
+    /// client fill Transient, which truncates the response.
+    #[arg(long, env = "STALEWISE_TRANSIT_BUFFER", default_value_t = 1_048_576)]
+    pub transit_buffer: u64,
     #[arg(long, env = "STALEWISE_VARNISH_PARAM", value_delimiter = ',', action = ArgAction::Append)]
     pub varnish_param: Vec<String>,
     #[arg(long, env = "STALEWISE_MAX_VCLS", default_value_t = 5)]
@@ -393,6 +397,7 @@ pub struct Config {
     pub admin_timeout: Duration,
     pub storage: String,
     pub transient_storage: String,
+    pub transit_buffer: u64,
     pub varnish_params: Vec<VarnishParam>,
     pub max_vcls: usize,
     pub startup_timeout: Duration,
@@ -607,6 +612,7 @@ impl Config {
             admin_timeout: positive("--admin-timeout", cli.admin_timeout)?,
             storage: opaque("--storage", cli.storage)?,
             transient_storage: opaque("--transient-storage", cli.transient_storage)?,
+            transit_buffer: cli.transit_buffer,
             varnish_params: varnish_params(&cli.varnish_param)?,
             max_vcls: at_least_one("--max-vcls", cli.max_vcls)?,
             startup_timeout: positive("--startup-timeout", cli.startup_timeout)?,

@@ -40,6 +40,7 @@ pub struct ProcessConfig {
     pub listen: SocketAddr,
     pub storage: String,
     pub transient_storage: String,
+    pub transit_buffer: u64,
     pub work_dir: PathBuf,
     pub params: Vec<VarnishParam>,
     pub startup_timeout: Duration,
@@ -53,7 +54,8 @@ pub enum ProcessState {
     Exited,
 }
 
-/// The exact argv, without a shell; zero TTL/grace/keep defaults precede operator params.
+/// The exact argv, without a shell; zero TTL/grace/keep defaults and the transit buffer precede
+/// operator params, so `--varnish-param` can override them.
 pub fn arguments(config: &ProcessConfig) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "-F".into(),
@@ -72,12 +74,16 @@ pub fn arguments(config: &ProcessConfig) -> Vec<OsString> {
         "-n".into(),
         config.work_dir.clone().into(),
     ];
-    let params = ZERO_DEFAULTS.iter().map(|p| (*p).to_owned()).chain(
-        config
-            .params
-            .iter()
-            .map(|p| format!("{}={}", p.key, p.value)),
-    );
+    let params = ZERO_DEFAULTS
+        .iter()
+        .map(|p| (*p).to_owned())
+        .chain([format!("transit_buffer={}", config.transit_buffer)])
+        .chain(
+            config
+                .params
+                .iter()
+                .map(|p| format!("{}={}", p.key, p.value)),
+        );
     for param in params {
         args.push("-p".into());
         args.push(param.into());
@@ -251,6 +257,7 @@ mod tests {
             listen: "0.0.0.0:8080".parse().unwrap(),
             storage: "malloc,256m".into(),
             transient_storage: "malloc,64m".into(),
+            transit_buffer: 1_048_576,
             work_dir: "/var/lib/varnish".into(),
             params: vec![VarnishParam {
                 key: "thread_pools".into(),
@@ -297,6 +304,8 @@ mod tests {
                 "default_grace=0",
                 "-p",
                 "default_keep=0",
+                "-p",
+                "transit_buffer=1048576",
                 "-p",
                 "thread_pools=2",
             ]

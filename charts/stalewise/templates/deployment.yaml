@@ -118,6 +118,8 @@ spec:
               value: {{ .Values.storage | quote }}
             - name: STALEWISE_TRANSIENT_STORAGE
               value: {{ .Values.transientStorage | quote }}
+            - name: STALEWISE_TRANSIT_BUFFER
+              value: {{ .Values.transitBuffer | int64 | toString | quote }}
             - name: STALEWISE_MAX_VCLS
               value: {{ .Values.maxVcls | int64 | toString | quote }}
             - name: STALEWISE_UNCACHEABLE_TTL

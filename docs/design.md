@@ -85,6 +85,7 @@ CLI overrides environment, then the `--config` file, then profile defaults. List
 | `--admin-timeout` | `STALEWISE_ADMIN_TIMEOUT` | 5s |
 | `--storage` | `STALEWISE_STORAGE` | malloc,256m |
 | `--transient-storage` | `STALEWISE_TRANSIENT_STORAGE` | malloc,64m, rendered as `-s Transient=...` |
+| `--transit-buffer` | `STALEWISE_TRANSIT_BUFFER` | 1048576 bytes, rendered as `-p transit_buffer=...`; 0 is unlimited |
 | `--varnish-param` | `STALEWISE_VARNISH_PARAM` | empty key=value list |
 | `--max-vcls` | `STALEWISE_MAX_VCLS` | 5 including active |
 | `--startup-timeout` | `STALEWISE_STARTUP_TIMEOUT` | 60s |

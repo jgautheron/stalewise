@@ -198,6 +198,10 @@ pub(crate) async fn run_cache_with(
     .map(|s| (*s).to_owned())
     .collect();
     argv.extend_from_slice(docker_extra);
+    // Mimics a small CI runner locally, e.g. STALEWISE_IT_CPUS=1.
+    if let Ok(cpus) = std::env::var("STALEWISE_IT_CPUS") {
+        argv.push(format!("--cpus={cpus}"));
+    }
     argv.push(image());
     argv.extend_from_slice(args);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();

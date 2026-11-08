@@ -131,6 +131,10 @@
       "type": "string",
       "pattern": "^[^\\s]+$"
     },
+    "transitBuffer": {
+      "type": "integer",
+      "minimum": 0
+    },
     "stripRewriteHeaders": {
       "type": "boolean"
     },

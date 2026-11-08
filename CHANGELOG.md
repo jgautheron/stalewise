@@ -12,6 +12,7 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 
 - Only WebSocket handshakes are piped. Other `Upgrade` requests pass with the header removed, and `Expect` requests pass, so a declined upgrade can no longer tunnel later requests past VCL.
 - `--transient-storage` (`STALEWISE_TRANSIENT_STORAGE`, default `malloc,64m`) bounds the Transient stevedore, which Varnish otherwise leaves unbounded. The chart adds `transientStorage` and a default 512Mi memory limit.
+- `--transit-buffer` (`STALEWISE_TRANSIT_BUFFER`, default 1048576 bytes, chart `transitBuffer`) sets Varnish `transit_buffer`, so an uncacheable fetch waits for its client instead of filling Transient. Before, a client reading slower than the origin got a truncated body once a large pass response outgrew `--transient-storage`.
 - The image workflow signs the index digest reported by its own `imagetools create`, instead of re-reading the mutable version tag, so a repointed tag can no longer obtain a trusted signature. CI runs actionlint and `scripts/workflow-check.sh`.
 - CachePolicy conflict messages name at most three rivals plus a count, so many same-prefix policies no longer cause quadratic memory use. `--max-cache-policies` (default 256, chart `cachePolicies.maxPolicies`) admits the oldest policies and marks the rest Invalid with reason `TooManyPolicies`.
 - `PURGE` applies the CachePolicy query allow-list and key headers, so it removes objects stored under a normalized key. Before, `PURGE /asset?tracking=x` missed an object stored as `/asset`.

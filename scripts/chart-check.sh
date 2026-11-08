@@ -35,6 +35,7 @@ validate "$out"
 helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog >"$out"
 expect 'name: catalog-cache-stalewise'
 expect 'value: "malloc,64m"'
+expect 'value: "1048576"'
 expect 'memory: 512Mi'
 expect 'terminationGracePeriodSeconds: 45'
 expect 'value: "10s"'

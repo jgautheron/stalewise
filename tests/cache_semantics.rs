@@ -36,6 +36,17 @@ impl Drop for Fixture {
 }
 
 async fn fixture(name: &str, profile: Profile, storage: &str, keep: bool) -> Fixture {
+    fixture_with(name, profile, storage, keep, &[], &[]).await
+}
+
+async fn fixture_with(
+    name: &str,
+    profile: Profile,
+    storage: &str,
+    keep: bool,
+    docker_extra: &[String],
+    extra: &[String],
+) -> Fixture {
     let origin = Origin::start().await;
     let dir = temp_dir(name);
     std::fs::write(dir.join("token"), TOKEN).unwrap();
@@ -86,7 +97,8 @@ async fn fixture(name: &str, profile: Profile, storage: &str, keep: bool) -> Fix
         "--template=/config/template.vcl".into(),
         format!("--storage={storage}"),
     ]);
-    let cache = run_cache(&dir, &args).await;
+    args.extend_from_slice(extra);
+    let cache = run_cache_with(&dir, docker_extra, &args).await;
     warm(cache.traffic).await;
     Fixture { cache, origin, dir }
 }
@@ -794,22 +806,24 @@ async fn stale_while_revalidate_keeps_objects_through_background_server_errors()
     for status in [500, 502, 503] {
         let mut failure = route.clone();
         failure.status = status;
+        // Keeps each background fetch busy long enough that stale hits coalesce onto it.
+        failure.delay = Duration::from_millis(500);
         f.origin.set("/swr", failure);
         let before = f.origin.count("/swr");
-        let stale = request(f.cache.traffic, "GET", "/swr", "").await;
-        assert_eq!(stale.status, 200);
-        assert!(stale.is_hit());
-        assert_eq!(stale.body, first.body, "{status}: stale survives");
+        // Varnish runs one background fetch per object at a time, so a second failed fetch
+        // proves the first was abandoned while every request in between stayed a stale hit.
         wait_for(
-            "background error fetch",
-            Duration::from_secs(5),
-            async || f.origin.count("/swr") > before,
+            "two background error fetches",
+            Duration::from_secs(10),
+            async || {
+                let stale = request(f.cache.traffic, "GET", "/swr", "").await;
+                assert_eq!(stale.status, 200, "{status}: no hit-for-miss poisoning");
+                assert!(stale.is_hit(), "{status}: served from cache");
+                assert_eq!(stale.body, first.body, "{status}: stale survives");
+                f.origin.count("/swr") >= before + 2
+            },
         )
         .await;
-        let again = request(f.cache.traffic, "GET", "/swr", "").await;
-        assert_eq!(again.status, 200, "{status}: no hit-for-miss poisoning");
-        assert!(again.is_hit());
-        assert_eq!(again.body, first.body);
     }
     f.origin.set("/swr", route);
     let before = f.origin.count("/swr");
@@ -882,4 +896,143 @@ async fn stale_if_error_is_health_gated_and_ends_at_its_deadline() {
     let expired = request(f.cache.traffic, "GET", "/sie", "").await;
     assert_eq!(expired.status, 503, "expired SIE never serves stale");
     assert_ne!(expired.body, refreshed.body);
+}
+
+const MIB: usize = 1024 * 1024;
+
+/// Reads at most `rate` bytes per second; returns the byte count and SHA-256, or why it stopped.
+async fn throttled(addr: SocketAddr, path: &str, rate: usize) -> Result<(usize, Vec<u8>), String> {
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .unwrap();
+    let _driver = Driver(tokio::spawn(async move {
+        let _ = conn.await;
+    }));
+    let req = Request::builder()
+        .uri(path)
+        .header("host", "catalog.test")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let response = sender.send_request(req).await.unwrap();
+    if response.status() != 200 {
+        return Err(format!("status {}", response.status()));
+    }
+    let mut body = response.into_body();
+    let start = Instant::now();
+    let mut bytes = 0;
+    let mut hash = Sha256::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| format!("after {bytes} bytes: {e:?}"))?;
+        if let Ok(data) = frame.into_data() {
+            bytes += data.len();
+            hash.update(&data);
+        }
+        let due = Duration::from_secs_f64(bytes as f64 / rate as f64);
+        if let Some(wait) = due.checked_sub(start.elapsed()) {
+            tokio::time::sleep(wait).await;
+        }
+    }
+    Ok((bytes, hash.finalize().to_vec()))
+}
+
+fn stat(id: &str, field: &str) -> u64 {
+    let out = docker(&[
+        "exec",
+        id,
+        "varnishstat",
+        "-n",
+        "/var/lib/varnish",
+        "-1",
+        "-f",
+        field,
+    ]);
+    out.split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no {field}: {out}"))
+}
+
+async fn slow_pass_fixture(name: &str, docker_extra: &[String]) -> Fixture {
+    let f = fixture_with(
+        name,
+        Profile::Generic,
+        "malloc,16m",
+        false,
+        docker_extra,
+        &["--transient-storage=malloc,16m".into()],
+    )
+    .await;
+    let mut route = Route::headers(&[("cache-control", "no-store")]);
+    route
+        .headers
+        .push(("content-length".into(), SLOW_BODY.to_string()));
+    route.size = Some(SLOW_BODY);
+    f.origin.set("/slow", route);
+    f
+}
+
+/// Far larger than the 16 MiB Transient store, so the fetch cannot buffer it whole.
+const SLOW_BODY: usize = 200 * MIB;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker"]
+async fn slow_client_receives_a_pass_body_larger_than_transient() {
+    let f = slow_pass_fixture("slow-client", &[]).await;
+    let received = tokio::time::timeout(
+        Duration::from_secs(120),
+        throttled(f.cache.traffic, "/slow", 40 * MIB),
+    )
+    .await
+    .expect("slow client finishes");
+    assert_eq!(received, Ok((SLOW_BODY, checksum(SLOW_BODY))));
+    assert_eq!(
+        stat(&f.cache.id, "SMA.Transient.c_fail"),
+        0,
+        "the fetch waits for the client instead of filling Transient"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker"]
+async fn concurrent_slow_clients_of_large_pass_bodies_stay_within_memory() {
+    const CLIENTS: usize = 20;
+    // The chart's default memory limit.
+    const LIMIT: u64 = 512 * MIB as u64;
+    let docker_extra = [
+        format!("--memory={LIMIT}"),
+        format!("--memory-swap={LIMIT}"),
+    ];
+    let f = slow_pass_fixture("slow-clients", &docker_extra).await;
+    let clients = (0..CLIENTS).map(|_| {
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            throttled(f.cache.traffic, "/slow", 20 * MIB),
+        )
+    });
+    let results = futures_util::future::join_all(clients).await;
+    assert!(
+        results.iter().all(Result::is_ok),
+        "every client ends, complete or cut short"
+    );
+    assert_eq!(f.origin.count("/slow"), CLIENTS);
+    assert_eq!(
+        docker(&[
+            "inspect",
+            "-f",
+            "{{.State.Running}} {{.State.OOMKilled}}",
+            &f.cache.id
+        ]),
+        "true false",
+        "the cache survives {CLIENTS} slow clients"
+    );
+    let peak: u64 = docker(&["exec", &f.cache.id, "cat", "/sys/fs/cgroup/memory.peak"])
+        .parse()
+        .unwrap();
+    assert!(peak < LIMIT, "memory peak {peak}");
+    assert_eq!(
+        throttled(f.cache.traffic, "/slow", usize::MAX).await,
+        Ok((SLOW_BODY, checksum(SLOW_BODY))),
+        "Transient is released once the load ends"
+    );
 }

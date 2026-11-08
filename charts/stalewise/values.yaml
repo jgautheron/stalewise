@@ -37,6 +37,9 @@ ports:
 storage: malloc,256m
 # Uncacheable and short-lived objects; keep it finite so a slow client cannot exhaust memory.
 transientStorage: malloc,64m
+# Bytes an uncacheable fetch may read ahead of its client (Varnish transit_buffer).
+# Each slow stream holds a few times this in Transient; 0 lets one slow client fill Transient and truncate.
+transitBuffer: 1048576
 maxVcls: 5
 uncacheableTtl: 30s
 maxObjectSize: 10485760

@@ -92,6 +92,8 @@ The embedded templates cache only what the origin's headers allow.
 - `Expect: 100-continue` requests pass to the origin.
 - `Set-Cookie`, `private`, `no-store`, `no-cache`, `Vary: *` and `text/event-stream` responses are never stored.
 - Uncacheable and streamed pass responses use the Transient store, bounded by `--transient-storage` (default `malloc,64m`).
+  `--transit-buffer` (default 1048576 bytes) limits how far such a fetch reads ahead of its client, so a slow client still receives the whole body.
+  Each slow stream holds a few times this value in Transient; size `transientStorage` for your concurrent large uncacheable streams, because a full store cuts responses short.
 - Uncacheable responses become hit-for-miss objects for `--uncacheable-ttl` (default 30s).
 - Responses whose `Content-Length` exceeds `--max-object-size` (default 10 MiB) stream without being stored.
 - `Surrogate-Key` and `Cache-Tag` values are indexed for tag invalidation and removed before delivery.

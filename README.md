@@ -366,7 +366,7 @@ When the working set reaches `--memguard-high` (default 0.85) of the memory limi
 - The first T is half the age of the oldest possible object, capped at `--memguard-max-age` (default 24h). stalewise derives that age from the varnishd start time and its own earlier bans, so no object listing is needed.
 - Each further ban halves T, down to `--memguard-min-age` (default 10s). Objects younger than the floor are never banned by the guard.
 - The guard issues at most one ban every 3 seconds (or every interval, if longer), so the ban lurker has time to evict before the next step.
-- A further ban needs the working set to have grown by 0.5% of the limit since the previous ban. glibc keeps freed memory for reuse instead of returning it, so a flat working set means the last ban is working.
+- A further ban needs the working set to be above high water and to have grown by 0.5% of the limit since the previous ban. glibc keeps freed memory for reuse instead of returning it, so a flat working set means the last ban is working.
 - The episode ends when the working set falls below `--memguard-low` (default 0.75).
 
 Know these semantics before relying on the guard:

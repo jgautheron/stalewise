@@ -53,8 +53,8 @@ impl Thresholds {
 pub enum Action {
     /// Below high water, or back below low water.
     Idle,
-    /// Under pressure but rate-limited, not growing since the last ban, or nothing is older
-    /// than the floor.
+    /// Under pressure but rate-limited, below high water or not growing since the last ban, or
+    /// nothing is older than the floor.
     Hold,
     /// Ban objects cached longer than this.
     Ban(Duration),
@@ -110,7 +110,12 @@ impl Guard {
         {
             return Action::Hold;
         }
-        if episode.ratio_at_ban.is_some_and(|at| ratio < at + GROWTH) {
+        // After the first ban, step only while still above high water and growing; between the
+        // marks the episode just waits for low water.
+        if episode
+            .ratio_at_ban
+            .is_some_and(|at| ratio < t.high || ratio < at + GROWTH)
+        {
             return Action::Hold;
         }
         let oldest = now.saturating_duration_since(self.oldest_since);
@@ -389,6 +394,38 @@ mod tests {
         assert_eq!(step(&mut guard, start, 1002 * S, 0.9), Action::Hold);
         assert!(matches!(
             step(&mut guard, start, 1003 * S, 0.91),
+            Action::Ban(_)
+        ));
+    }
+
+    #[test]
+    fn further_steps_need_growth_above_high_water() {
+        let start = Instant::now();
+        let mut guard = Guard::new(thresholds(), start);
+        let at = Duration::from_secs;
+        assert!(matches!(
+            step(&mut guard, start, at(1000), 0.9),
+            Action::Ban(_)
+        ));
+        assert_eq!(step(&mut guard, start, at(1010), 0.9), Action::Hold, "flat");
+        assert_eq!(
+            step(&mut guard, start, at(1020), 0.904),
+            Action::Hold,
+            "noise below GROWTH"
+        );
+        assert!(
+            matches!(step(&mut guard, start, at(1030), 0.91), Action::Ban(_)),
+            "growth resumes"
+        );
+        assert_eq!(step(&mut guard, start, at(1040), 0.80), Action::Hold);
+        assert_eq!(
+            step(&mut guard, start, at(1050), 0.84),
+            Action::Hold,
+            "growth between the marks waits for high water"
+        );
+        assert!(guard.active());
+        assert!(matches!(
+            step(&mut guard, start, at(1060), 0.92),
             Action::Ban(_)
         ));
     }

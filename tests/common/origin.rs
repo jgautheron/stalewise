@@ -86,9 +86,14 @@ impl Origin {
                             let service = hyper::service::service_fn(move |req| {
                                 respond(req, state.clone(), active.clone(), peak.clone())
                             });
-                            let _ = tokio::time::timeout(Duration::from_secs(60),
-                                hyper::server::conn::http1::Builder::new()
-                                    .serve_connection(TokioIo::new(stream), service)).await;
+                            // Idle keep-alive connections close after the header timeout. A fixed
+                            // lifetime instead closed every pooled backend connection at once and
+                            // starved Varnish's reconnects at the accept cap (MAIN.backend_fail).
+                            let _ = hyper::server::conn::http1::Builder::new()
+                                .timer(hyper_util::rt::TokioTimer::new())
+                                .header_read_timeout(Duration::from_secs(30))
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}

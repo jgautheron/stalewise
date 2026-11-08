@@ -24,7 +24,7 @@ The reloader and the signaller keep their own sessions and are unaffected.
    No admin command lists object ages cheaply, so stalewise bounds the oldest age from the varnishd start time, raised by every confirmed ban.
    This replaces a binary search from the cap.
 5. Each further ban halves T, floored at `--memguard-min-age` (default 10s).
-6. At most one ban per `max(interval, 3s)`, and only when the working set has grown by 0.5% of the limit since the previous ban.
+6. At most one ban per `max(interval, 3s)`, and only when the working set is above high water and has grown by 0.5% of the limit since the previous ban.
    glibc keeps freed memory for reuse, so a flat working set after a ban means the ban is working; banning further would drain the cache without lowering memory.
 7. The episode ends below `--memguard-low` (default 0.75).
 8. Failures are logged, counted, and set the `memory guard failing` readiness reason without failing readiness.
@@ -77,6 +77,7 @@ Disabling transparent huge pages did not help measurably, so it is not implement
 
 ## Verification
 
+- The test origin used to close every connection after a fixed 60 seconds. Varnish then lost all pooled backend connections at once, and its reconnects hit the origin's accept cap: `MAIN.backend_fail` rose with `SMA.*.c_fail` and `MAIN.n_lru_limited` at 0, and the client saw a 503. The origin now closes only idle connections.
 - Unit tests drive the state machine with a synthetic clock: thresholds, hysteresis, T stepping, the floor, rate limiting, growth gating and cgroup parsing.
 - A Docker test fills a 224 MiB container (64m storage, 16m Transient, passing the startup check) with 200,000 objects of 100 bytes at 2,000 per second.
   With the guard: no OOM kill, every request answered 200, a working-set peak of about 208 MB against a 235 MB limit, a few bans, the newest objects hit, the oldest evicted, and no guard ban left in `ban.list`.

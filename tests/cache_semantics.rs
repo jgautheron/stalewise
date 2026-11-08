@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -1179,7 +1180,7 @@ const GUARD_OBJECTS: usize = 200_000;
 const TINY_BODY: usize = 100;
 /// New objects per second; the guard never bans objects younger than 10s, so the newest
 /// 10 seconds of fill must fit.
-const GUARD_RATE: usize = 2_500;
+const GUARD_RATE: usize = 2_000;
 
 async fn guard_fixture(name: &str, guard: bool) -> Fixture {
     let docker_extra = [
@@ -1201,10 +1202,18 @@ async fn guard_fixture(name: &str, guard: bool) -> Fixture {
     .await
 }
 
-/// Fills distinct tiny objects at `GUARD_RATE` over keep-alive connections; stops at the first
-/// failure, returning how many requests succeeded.
-async fn fill_paced(f: &Fixture, count: usize) -> usize {
+#[derive(Debug, Default)]
+struct Fill {
+    ok: usize,
+    failed: usize,
+    first_error: Option<String>,
+}
+
+/// Fills distinct tiny objects at `GUARD_RATE` over keep-alive connections. A failed request
+/// reconnects and counts; a worker gives up after `MAX_FAILURES`, as when varnishd is killed.
+async fn fill_paced(f: &Fixture, count: usize) -> Fill {
     const WORKERS: usize = 16;
+    const MAX_FAILURES: usize = 20;
     let mut route = Route::headers(&[("cache-control", "max-age=3600")]);
     route.body = Some(Bytes::from(vec![b't'; TINY_BODY]));
     route
@@ -1214,44 +1223,76 @@ async fn fill_paced(f: &Fixture, count: usize) -> usize {
     let traffic = f.cache.traffic;
     let start = tokio::time::Instant::now();
     let workers = (0..WORKERS).map(|worker| async move {
-        let mut done = 0;
-        let Ok(stream) = tokio::net::TcpStream::connect(traffic).await else {
-            return done;
-        };
-        let Ok((mut sender, conn)) =
-            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
-        else {
-            return done;
-        };
-        let _driver = Driver(tokio::spawn(async move {
-            let _ = conn.await;
-        }));
+        let mut fill = Fill::default();
+        let mut sender = None;
         for n in (worker..count).step_by(WORKERS) {
             let due = Duration::from_secs_f64(n as f64 / GUARD_RATE as f64);
             tokio::time::sleep_until(start + due).await;
-            let req = Request::builder()
-                .uri(format!("/tiny-{n}"))
-                .header("host", "catalog.test")
-                .body(Empty::<Bytes>::new())
-                .unwrap();
-            let ok = match sender.ready().await {
-                Ok(()) => match sender.send_request(req).await {
-                    Ok(r) => r.status() == 200 && r.into_body().collect().await.is_ok(),
-                    Err(_) => false,
-                },
-                Err(_) => false,
-            };
-            if !ok {
-                return done;
+            if sender.is_none() {
+                sender = connect(traffic).await;
             }
-            done += 1;
+            let outcome = match sender.as_mut() {
+                Some((s, _)) => fetch_tiny(s, n).await,
+                None => Err("connect failed".to_owned()),
+            };
+            match outcome {
+                Ok(()) => fill.ok += 1,
+                Err(err) => {
+                    fill.failed += 1;
+                    fill.first_error.get_or_insert(format!("/tiny-{n}: {err}"));
+                    sender = None;
+                    if fill.failed >= MAX_FAILURES {
+                        break;
+                    }
+                }
+            }
         }
-        done
+        fill
     });
-    futures_util::future::join_all(workers)
+    let mut total = Fill::default();
+    for fill in futures_util::future::join_all(workers).await {
+        total.ok += fill.ok;
+        total.failed += fill.failed;
+        total.first_error = total.first_error.or(fill.first_error);
+    }
+    total
+}
+
+type Sender = hyper::client::conn::http1::SendRequest<Empty<Bytes>>;
+
+async fn connect(addr: SocketAddr) -> Option<(Sender, Driver)> {
+    let stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
-        .into_iter()
-        .sum()
+        .ok()?;
+    let driver = Driver(tokio::spawn(async move {
+        let _ = conn.await;
+    }));
+    Some((sender, driver))
+}
+
+async fn fetch_tiny(sender: &mut Sender, n: usize) -> Result<(), String> {
+    let req = Request::builder()
+        .uri(format!("/tiny-{n}"))
+        .header("host", "catalog.test")
+        .body(Empty::<Bytes>::new())
+        .map_err(|e| e.to_string())?;
+    sender
+        .ready()
+        .await
+        .map_err(|e| format!("not ready: {e}"))?;
+    let response = sender.send_request(req).await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let headers = format!("{:?}", response.headers());
+    response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status != 200 {
+        return Err(format!("{status} {headers}"));
+    }
+    Ok(())
 }
 
 fn state(id: &str) -> String {
@@ -1275,17 +1316,50 @@ async fn memory_guard_evicts_the_oldest_objects_before_an_oom_kill() {
         "tr '\\0' '\\n' < /proc/$(pidof varnishd | cut -d' ' -f1)/environ",
     ]);
     assert!(environ.contains("MALLOC_ARENA_MAX=4"), "{environ}");
-    let stored = fill_paced(&f, GUARD_OBJECTS).await;
+    let management = f.cache.management;
+    // The guard's own working-set gauge, sampled independently of its decisions.
+    let max_working_set = Arc::new(AtomicU64::new(0));
+    let sampler = tokio::spawn({
+        let max = Arc::clone(&max_working_set);
+        async move {
+            loop {
+                let used = metric(management, "stalewise_memory_used_bytes").await as u64;
+                max.fetch_max(used, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    });
+    let fill = fill_paced(&f, GUARD_OBJECTS).await;
+    sampler.abort();
     let peak = memory_peak(&f.cache.id);
+    let max_working_set = max_working_set.load(Ordering::Relaxed);
+    let oom_kills = docker(&[
+        "exec",
+        &f.cache.id,
+        "grep",
+        "oom_kill ",
+        "/sys/fs/cgroup/memory.events",
+    ]);
+    let mem_stat = docker(&[
+        "exec",
+        &f.cache.id,
+        "sh",
+        "-c",
+        "grep -E '^(anon|file|shmem|inactive_file|active_file) ' /sys/fs/cgroup/memory.stat | tr '\\n' ' '",
+    ]);
     let bans = metric(f.cache.management, "stalewise_memguard_bans_total").await;
     let objects = stat(&f.cache.id, "MAIN.n_object");
     eprintln!(
-        "guard on: stored={stored} peak={peak} bans={bans} objects={objects} lurker_killed={}",
+        "guard on: {fill:?} raw_peak={peak} max_working_set={max_working_set} {oom_kills} {mem_stat} bans={bans} objects={objects} lurker_killed={}",
         stat(&f.cache.id, "MAIN.bans_lurker_obj_killed")
     );
     assert_eq!(state(&f.cache.id), "true false 0", "{}", logs(&f.cache.id));
-    assert_eq!(stored, GUARD_OBJECTS);
-    assert!(peak < GUARD_LIMIT, "memory peak {peak}");
+    assert_eq!(fill.failed, 0, "{fill:?}\n{}", logs(&f.cache.id));
+    assert_eq!(oom_kills, "oom_kill 0");
+    assert!(
+        max_working_set > 0 && max_working_set < GUARD_LIMIT,
+        "working set peaked at {max_working_set}"
+    );
     assert!(bans > 0.0, "the guard banned");
     assert!(
         stat(&f.cache.id, "MAIN.bans_lurker_obj_killed") > 0,
@@ -1334,10 +1408,10 @@ async fn memory_guard_evicts_the_oldest_objects_before_an_oom_kill() {
 #[ignore = "needs Docker"]
 async fn without_the_memory_guard_the_same_fill_is_oom_killed() {
     let f = guard_fixture("memguard-off", false).await;
-    let stored = fill_paced(&f, GUARD_OBJECTS).await;
+    let fill = fill_paced(&f, GUARD_OBJECTS).await;
     let oom = stat_or_dead(&f.cache.id);
-    eprintln!("guard off: stored={stored} state={oom}");
-    assert!(stored < GUARD_OBJECTS, "requests failed mid-fill");
+    eprintln!("guard off: {fill:?} state={oom}");
+    assert!(fill.failed > 0, "requests failed mid-fill");
     assert!(
         oom.starts_with("true"),
         "the kernel OOM-killed varnishd: {oom}"

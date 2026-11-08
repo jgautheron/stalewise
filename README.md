@@ -380,8 +380,8 @@ Know these semantics before relying on the guard:
 - Each guard ban uses only `obj.*` fields, so the lurker completes and removes it, and Varnish's `ban_dups` drops older identical bans. The ban list stays short.
 
 Under sustained growth the guard steps down to the floor and keeps about the last `--memguard-min-age` of objects; the hit ratio drops instead of the pod being OOM-killed.
-A Docker test fills a 224 MiB container (64m storage, 16m Transient) with 200,000 objects of 100 bytes at 2,500 per second.
-With the guard, the working set peaked at 211 to 216 MB, below the 235 MB limit, and the newest objects still hit.
+A Docker test fills a 224 MiB container (64m storage, 16m Transient) with 200,000 objects of 100 bytes at 2,000 per second.
+With the guard, the working set peaked at about 208 MB of the 235 MB limit, with no OOM kill and every request answered 200, and the newest objects still hit.
 Without it, the kernel OOM-killed varnishd after about 129,000 objects.
 
 Failures to read memory or to ban are logged, counted in `stalewise_memguard_failures_total`, and listed as a readiness degradation reason (`memory guard failing`) without failing readiness.

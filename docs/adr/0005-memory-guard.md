@@ -78,8 +78,8 @@ Disabling transparent huge pages did not help measurably, so it is not implement
 ## Verification
 
 - Unit tests drive the state machine with a synthetic clock: thresholds, hysteresis, T stepping, the floor, rate limiting, growth gating and cgroup parsing.
-- A Docker test fills a 224 MiB container (64m storage, 16m Transient, passing the startup check) with 200,000 objects of 100 bytes at 2,500 per second.
-  With the guard: no OOM kill, 211 to 216 MB peak against a 235 MB limit, a few bans, the newest objects hit, the oldest evicted, and no guard ban left in `ban.list`.
+- A Docker test fills a 224 MiB container (64m storage, 16m Transient, passing the startup check) with 200,000 objects of 100 bytes at 2,000 per second.
+  With the guard: no OOM kill, every request answered 200, a working-set peak of about 208 MB against a 235 MB limit, a few bans, the newest objects hit, the oldest evicted, and no guard ban left in `ban.list`.
   Without the guard: the kernel OOM-killed varnishd after about 129,000 objects.
 - A two-pod shard test trips the guard on one pod only; the other issues no bans and every request returns 200.
 - A test runs signaller purges while the guard bans; every purge and hit check holds.

@@ -158,16 +158,23 @@ async fn start_origin() -> (u16, SharedOrigin) {
     let port = listener.local_addr().unwrap().port();
     let origin: SharedOrigin = Arc::default();
     let state = Arc::clone(&origin);
-    let limits = Limits {
-        header_timeout: Duration::from_secs(5),
-        connection_timeout: Duration::from_secs(30),
-    };
-    tokio::spawn(http::serve(
-        listener,
-        limits,
-        move |req| origin_handler(Arc::clone(&state), req),
-        CancellationToken::new(),
-    ));
+    // Keep-alive, unlike `http::serve`: a fresh backend connection per fetch churns Docker
+    // Desktop's host gateway, which then fails connects with ENETUNREACH.
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let state = Arc::clone(&state);
+            let service = hyper::service::service_fn(move |req| {
+                let response = origin_handler(Arc::clone(&state), req);
+                async move { Ok::<_, std::convert::Infallible>(response.await) }
+            });
+            tokio::spawn(
+                hyper::server::conn::http1::Builder::new()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(Duration::from_secs(30))
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service),
+            );
+        }
+    });
     (port, origin)
 }
 
@@ -1817,7 +1824,8 @@ async fn memory_guard_bans_and_signaller_purges_run_together() {
     let mut purges = 0;
     while Instant::now() < deadline {
         let path = format!("/cache?p={purges}");
-        request(c.traffic, "GET", &path, "").await;
+        let miss = request(c.traffic, "GET", &path, "").await;
+        assert_eq!(miss.status, 200, "{path}: {}", miss.body);
         assert!(
             request(c.traffic, "GET", &path, "").await.is_hit(),
             "{path}"

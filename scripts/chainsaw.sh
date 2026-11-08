@@ -40,5 +40,7 @@ echo 'c39b1abd1c3485809fa77441266f4ebb53d9305643c0e754db51fe0d1f11c354  test/cha
 kubectl apply --server-side -f test/chainsaw/vendor/istio-crds.yaml
 kubectl wait --for=condition=Established --timeout=60s \
   crd/virtualservices.networking.istio.io crd/authorizationpolicies.security.istio.io crd/peerauthentications.security.istio.io
-.tools/chainsaw test "${@:-test/chainsaw}" --remarshal --exec-timeout 240s --assert-timeout "${CHAINSAW_ASSERT_TIMEOUT:-120s}" \
-  --report-format JUNIT-STEP --report-path "${CHAINSAW_REPORT_DIR:-$STALEWISE_ROOT/.tools/reports/$cluster}"
+report_dir=${CHAINSAW_REPORT_DIR:-$STALEWISE_ROOT/.tools/reports/$cluster}
+mkdir -p "$report_dir"
+.tools/chainsaw test "${@:-test/chainsaw}" --remarshal --cleanup-timeout 120s --delete-timeout 120s --exec-timeout 240s --assert-timeout "${CHAINSAW_ASSERT_TIMEOUT:-120s}" \
+  --report-format JUNIT-STEP --report-path "$report_dir"

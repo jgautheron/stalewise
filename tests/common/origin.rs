@@ -76,7 +76,7 @@ impl Origin {
             let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
-                    accepted = listener.accept() => {
+                    accepted = listener.accept(), if connections.len() < 128 => {
                         let Ok((stream, _)) = accepted else { break };
                         let state = shared.clone();
                         let active = active.clone();

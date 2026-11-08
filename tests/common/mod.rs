@@ -202,12 +202,16 @@ pub(crate) async fn run_cache_with(
     argv.extend_from_slice(args);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let id = docker(&refs);
-    let c = Container {
-        traffic: mapped(&id, "8080/tcp"),
-        signaller: mapped(&id, "8081/tcp"),
-        management: mapped(&id, "9090/tcp"),
+    let unbound = SocketAddr::from(([127, 0, 0, 1], 0));
+    let mut c = Container {
         id,
+        traffic: unbound,
+        signaller: unbound,
+        management: unbound,
     };
+    c.traffic = mapped(&c.id, "8080/tcp");
+    c.signaller = mapped(&c.id, "8081/tcp");
+    c.management = mapped(&c.id, "9090/tcp");
     let management = c.management;
     let id = c.id.clone();
     wait_for("readiness", Duration::from_secs(90), async || {

@@ -50,6 +50,7 @@ async fn fixture(name: &str, profile: Profile, storage: &str, keep: bool) -> Fix
         probe_path: "/".into(),
         uncacheable_ttl: Duration::from_secs(30),
         max_object_size: 10 * 1024 * 1024,
+        strip_rewrite_headers: true,
         shard: None,
     };
     let policies = if keep {

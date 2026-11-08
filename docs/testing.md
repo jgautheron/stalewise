@@ -106,7 +106,8 @@ All fifteen new Docker test groups have assertion-RED proof. The final 36 VCL mu
 
 Kubernetes mutation checks removed the PDB, granted VirtualService writes, admitted negative TTL, and broke the management port.
 Further checks changed Active to Pending, disabled conflict detection, and skipped source-loop validation.
-Each produced a failure at its corresponding assertion. Source and chart files were restored after each run.
+Each produced a failure at its corresponding assertion. A deterministic nine-policy capacity limit failed on `many-8`.
+Forcing 256 MiB storage instead of the requested 4 MiB failed the oldest-object eviction assertion. Source and chart files were restored after each run.
 
 Initial insufficient mutations were replaced, not counted as successes. Removing one surrogate strip left the other intact.
 Removing zero-TTL handling still inherited native Varnish rejection. An infinite hit window could not revive already-evicted objects.
@@ -118,3 +119,17 @@ At the original base, `charts/stalewise/templates/deployment.yaml:185-205` had p
 `src/app.rs:361,379` cancelled the child; `src/varnish/process.rs:131,152-154` immediately sent SIGTERM.
 The engineer fixed draining separately on main in `658cc0c`. The tests were rebased onto that fix.
 The rollout suite remains independent and is enabled in the normal Kubernetes gate.
+
+## Final validation
+
+After rebasing onto `658cc0c`, both Kubernetes suites passed twice in separate kind clusters.
+Each run reported two passed tests, zero failures, and zero skips. Both rollout checks served continuously.
+The runner allows 120 seconds for namespace cleanup because pod termination now includes draining.
+The pre-fix resets were product failures; early fixture and cleanup failures were corrected before the final runs.
+
+Final local gates passed: formatting, clippy with all targets and denied warnings, 152 Rust unit tests, and 30 Docker tests.
+`cargo deny check` reported advisories, bans, licenses, and sources OK. `scripts/chart-check.sh` reported `chart-check: ok`.
+`actionlint` and `git diff --check` exited successfully without output.
+The final mutation run reported 36 assertion-RED VCL mutants; storage and eight Kubernetes mutants add nine independent RED checks.
+The two final kind runs used clusters `stalewise-tests-86712` and `stalewise-tests-4815`; both were deleted afterward.
+Each JUnit report contains the named controller and rollout steps with zero failures.

@@ -40,6 +40,13 @@ transientStorage: malloc,64m
 # Bytes an uncacheable fetch may read ahead of its client (Varnish transit_buffer).
 # Each slow stream holds a few times this in Transient; 0 lets one slow client fill Transient and truncate.
 transitBuffer: 1048576
+# Objects Varnish may evict to store one body (nuke_limit). Varnish's default of 50 cuts a large
+# response short once storage is full of small objects; 10000 covers maxObjectSize over 1 KiB objects.
+nukeLimit: 10000
+# Sizes the memory limit; see the README sizing section.
+capacity:
+  # Objects held at once, about 1 KiB each outside storage; 65536 is 256m of 4 KiB objects.
+  maxObjects: 65536
 maxVcls: 5
 uncacheableTtl: 30s
 maxObjectSize: 10485760
@@ -103,6 +110,12 @@ mesh:
   # Render a STRICT mTLS PeerAuthentication for the cache pods.
   peerAuthentication: false
   trustDomain: cluster.local
+  # Istio sidecar sizing, rendered as pod annotations; empty keeps the mesh defaults.
+  # Explicit podAnnotations win. Concurrency needs cpuLimit of at least that many cores.
+  proxy:
+    concurrency: 0
+    cpuRequest: ""
+    cpuLimit: ""
 
 serviceAccount:
   create: true
@@ -111,13 +124,12 @@ serviceAccount:
 
 podAnnotations: {}
 podLabels: {}
-# The memory limit budgets storage (256m) + transientStorage (64m) + ~190Mi process overhead.
+# An unset memory limit is derived: storage + transientStorage + 128Mi + 1 KiB x capacity.maxObjects
+# (512Mi by default). A smaller limit fails rendering. An unset memory request equals the limit.
 resources:
   requests:
     cpu: 100m
-    memory: 512Mi
-  limits:
-    memory: 512Mi
+  limits: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}

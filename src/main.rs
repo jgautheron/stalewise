@@ -28,6 +28,10 @@ fn main() -> ExitCode {
         .with(tracing_subscriber::fmt::layer().with_target(false))
         .with(filter)
         .init();
+    if let Err(err) = stalewise::capacity::check(&config.storage, &config.transient_storage) {
+        tracing::error!(error = %err, "startup failed");
+        return ExitCode::from(EXIT_CONFIG);
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

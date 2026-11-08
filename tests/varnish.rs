@@ -1707,3 +1707,19 @@ async fn ambiguous_paths_never_dodge_policy_bypass_rules() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn stores_larger_than_the_memory_limit_refuse_to_start() {
+    build_image_once();
+    let out = std::process::Command::new("docker")
+        .args(["run", "--rm", "--memory=192m", "--memory-swap=192m"])
+        .arg(image())
+        .args(base_args(1))
+        .args(["--storage=malloc,64m", "--transient-storage=malloc,16m"])
+        .output()
+        .unwrap();
+    let logs = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{logs}");
+    assert!(logs.contains("memory limit 192 MiB cannot hold"), "{logs}");
+}

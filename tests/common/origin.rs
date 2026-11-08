@@ -46,6 +46,7 @@ impl Route {
 #[derive(Default)]
 struct State {
     routes: HashMap<String, Route>,
+    fallback: Option<Route>,
     counts: HashMap<String, usize>,
     conditional: HashMap<String, usize>,
 }
@@ -106,6 +107,11 @@ impl Origin {
         self.state.lock().unwrap().routes.insert(path.into(), route);
     }
 
+    /// Serves unregistered paths, so tests can request many distinct objects.
+    pub fn set_fallback(&self, route: Route) {
+        self.state.lock().unwrap().fallback = Some(route);
+    }
+
     pub fn count(&self, path: &str) -> usize {
         *self.state.lock().unwrap().counts.get(path).unwrap_or(&0)
     }
@@ -135,6 +141,7 @@ async fn respond(
         let route = state
             .routes
             .get(&path)
+            .or(state.fallback.as_ref())
             .cloned()
             .unwrap_or_else(|| Route::headers(&[("cache-control", "max-age=60")]));
         let count = state.counts.entry(path.clone()).or_default();

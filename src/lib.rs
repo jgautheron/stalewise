@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod attach;
+pub mod capacity;
 pub mod config;
 pub mod controller;
 pub mod discovery;

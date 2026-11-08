@@ -329,6 +329,7 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         storage: config.storage.clone(),
         transient_storage: config.transient_storage.clone(),
         transit_buffer: config.transit_buffer,
+        nuke_limit: config.nuke_limit,
         work_dir: config.varnish_work_dir.clone(),
         params: config.varnish_params.clone(),
         startup_timeout: config.startup_timeout,

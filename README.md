@@ -96,6 +96,9 @@ The embedded templates cache only what the origin's headers allow.
   Each slow stream holds a few times this value in Transient; size `transientStorage` for your concurrent large uncacheable streams, because a full store cuts responses short.
 - Uncacheable responses become hit-for-miss objects for `--uncacheable-ttl` (default 30s).
 - Responses whose `Content-Length` exceeds `--max-object-size` (default 10 MiB) stream without being stored.
+- `--nuke-limit` (default 10000, chart `nukeLimit`) sets Varnish `nuke_limit`, the number of objects one fetch may evict to make room.
+  Varnish defaults to 50. With storage full of 2 KiB objects, a 9 MiB response then failed mid-stream and the client received a truncated body.
+  A fetch that still runs out of evictions is cut short the same way, and Varnish counts it in `MAIN.n_lru_limited`.
 - `Surrogate-Key` and `Cache-Tag` values are indexed for tag invalidation and removed before delivery.
 
 ## Cache policies
@@ -226,8 +229,7 @@ Cache pods can always reach each other's `http` port.
 The probe port has no rule, because kubelet traffic comes from the node.
 Earlier charts treated an empty list as "allow every source"; set `trafficFrom`, `managementFrom` and `signallerFrom` explicitly when you upgrade.
 Pods run as uid 1000 with a read-only root filesystem and emptyDir work volumes.
-The default memory limit is 512Mi: `storage` (256m) plus `transientStorage` (64m) plus process overhead.
-Raise `resources.limits.memory` together with either store.
+The chart derives the memory limit from the stores and the expected object count; see [Sizing memory](#sizing-memory).
 
 Each release publishes the chart as an OCI artifact and the image at the same version:
 
@@ -292,6 +294,56 @@ podAnnotations:
 ```
 
 Alternatively, set the proxy environment variable `EXIT_ON_ZERO_ACTIVE_CONNECTIONS=true` so the sidecar exits only after its connections close.
+
+### Sidecar CPU
+
+Every cache request crosses the Envoy sidecar, which becomes the throughput ceiling before Varnish does.
+`mesh.proxy.concurrency`, `mesh.proxy.cpuRequest` and `mesh.proxy.cpuLimit` render the `concurrency` field of `proxy.istio.io/config`, `sidecar.istio.io/proxyCPU` and `sidecar.istio.io/proxyCPULimit`.
+The concurrency merges into any `proxy.istio.io/config` from `podAnnotations`, and explicit `podAnnotations` win.
+`values-mesh.yaml` sets 4 workers, a 500m request and a 4-core limit.
+
+Measured on arm64 EKS with Istio STRICT mTLS, against the mesh defaults:
+
+| Sidecar | Hit max qps | Hit p99 | p99 at 2k qps | 100 KiB qps / p99 |
+|---|---|---|---|---|
+| Defaults | 9.8k to 10.1k | 5.2 to 5.4 ms | 3.0 to 3.4 ms | 6.2k to 6.4k / 7.6 ms |
+| `concurrency: 4`, CPU limit 2 | 9.7k | 27.4 ms | 3.0 ms | 5.9k / 38.8 ms |
+| `concurrency: 4`, CPU limit 4 | 12.7k (+28%) | 4.3 ms | 2.5 ms | 8.4k (+33%) / 6.3 ms |
+
+Four workers under the default CPU limit are throttled, and the tail latency grows instead.
+The chart therefore fails when `concurrency` exceeds the `cpuLimit` cores, or when `concurrency` is set without `cpuLimit`.
+The cost is CPU: each cache pod's sidecar may use up to 4 cores, so leave `mesh.proxy` empty when the node budget matters more than throughput.
+Varnish thread pool tuning showed no measurable effect.
+
+### Sizing memory
+
+Varnish keeps per-object state (object core, object head, hash entry, allocator slack) outside the malloc stevedore size.
+Many small objects can therefore exceed a memory limit that only covers `storage` and `transientStorage`.
+A 64m store with 16m of Transient and a 192Mi limit was OOM-killed after 20,000 objects of 2 KiB.
+
+The chart computes the smallest memory limit from this formula:
+
+```text
+limit = storage + transientStorage + 128Mi + 1 KiB x capacity.maxObjects
+```
+
+- `128Mi` is the base: varnishd, its 80 MiB shared log, and stalewise. An idle container measured 102 MiB on Varnish 9.1.
+- `1 KiB` per object covers the 0.6 to 1.2 KiB measured outside storage for 1 B and 2 KiB bodies, including LRU churn.
+- `capacity.maxObjects` (default 65536) is the number of objects held at once, which is roughly `storage / average object size`.
+
+An unset `resources.limits.memory` is derived from the formula, and a smaller explicit limit fails rendering.
+The defaults give 256m + 64m + 128Mi + 64Mi = 512Mi.
+
+Worked example: 500m of storage filled with 2 KiB objects holds about 256,000 objects.
+Set `storage: malloc,500m` and `capacity.maxObjects: 256000`.
+The limit is then 500 + 64 + 128 + 250 = 942Mi.
+
+Each evicted object leaves an object head of about 0.5 KiB, which Varnish frees up to about 6 minutes later (`critbit_cooloff`).
+A cache that evicts thousands of objects per second needs more headroom: add evictions per second x 360 s x 0.5 KiB.
+Watch `MAIN.n_lru_nuked` to estimate the rate.
+
+At startup, stalewise reads the cgroup memory limit and compares it with the stores plus the 128 MiB base.
+It refuses to start when they do not fit, and it logs a warning when the remaining headroom holds fewer objects than storage filled with 4 KiB objects.
 
 ## Attaching traffic with `cache.enabled`
 

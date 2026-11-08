@@ -41,6 +41,7 @@ pub struct ProcessConfig {
     pub storage: String,
     pub transient_storage: String,
     pub transit_buffer: u64,
+    pub nuke_limit: u32,
     pub work_dir: PathBuf,
     pub params: Vec<VarnishParam>,
     pub startup_timeout: Duration,
@@ -54,7 +55,7 @@ pub enum ProcessState {
     Exited,
 }
 
-/// The exact argv, without a shell; zero TTL/grace/keep defaults and the transit buffer precede
+/// The exact argv, without a shell; zero TTL/grace/keep defaults, transit buffer and nuke limit precede
 /// operator params, so `--varnish-param` can override them.
 pub fn arguments(config: &ProcessConfig) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
@@ -77,7 +78,10 @@ pub fn arguments(config: &ProcessConfig) -> Vec<OsString> {
     let params = ZERO_DEFAULTS
         .iter()
         .map(|p| (*p).to_owned())
-        .chain([format!("transit_buffer={}", config.transit_buffer)])
+        .chain([
+            format!("transit_buffer={}", config.transit_buffer),
+            format!("nuke_limit={}", config.nuke_limit),
+        ])
         .chain(
             config
                 .params
@@ -258,6 +262,7 @@ mod tests {
             storage: "malloc,256m".into(),
             transient_storage: "malloc,64m".into(),
             transit_buffer: 1_048_576,
+            nuke_limit: 10_000,
             work_dir: "/var/lib/varnish".into(),
             params: vec![VarnishParam {
                 key: "thread_pools".into(),
@@ -306,6 +311,8 @@ mod tests {
                 "default_keep=0",
                 "-p",
                 "transit_buffer=1048576",
+                "-p",
+                "nuke_limit=10000",
                 "-p",
                 "thread_pools=2",
             ]

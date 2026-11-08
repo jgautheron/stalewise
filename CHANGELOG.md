@@ -8,6 +8,17 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 
 ## [Unreleased]
 
+### Fixed
+
+- Many small objects no longer exceed the memory limit unnoticed. Varnish keeps about 1 KiB per object outside the stevedore size, so a 64m store with a 192Mi limit was OOM-killed after 20,000 objects of 2 KiB. The chart adds `capacity.maxObjects` (default 65536), derives an unset memory limit from `storage + transientStorage + 128Mi + 1 KiB x maxObjects`, and fails rendering when an explicit limit is smaller. The README has a sizing section.
+- stalewise reads the cgroup memory limit at startup. It refuses to start when the stores plus the 128 MiB base exceed the limit, and warns when the headroom is tight.
+- A large response no longer arrives truncated when storage is full of small objects. `--nuke-limit` (`STALEWISE_NUKE_LIMIT`, default 10000, chart `nukeLimit`) replaces the Varnish default of 50, which made a 9 MiB fetch give up mid-stream.
+
+### Changed
+
+- **Chart:** the default `resources` no longer sets a memory limit or request; both are derived (512Mi with the defaults).
+- **Chart:** `mesh.proxy.concurrency`, `mesh.proxy.cpuRequest` and `mesh.proxy.cpuLimit` render the Istio sidecar annotations and merge with `podAnnotations`. Rendering fails when the concurrency exceeds the CPU limit in cores. `values-mesh.yaml` sets 4 workers, a 500m request and a 4-core limit, which measured +28% hit throughput and a lower p99 at the cost of more reserved CPU.
+
 ## [0.4.0] - 2026-11-08
 
 ### Security

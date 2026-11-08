@@ -71,6 +71,8 @@ The following test names refer to `tests/cache_semantics.rs`.
 | 0, 1, 1024, 1048576, 10380902 bytes | Cached; full byte count and SHA256 match | `payload_sizes_cache_below_limit_and_stream_larger_bodies_intact` |
 | 10485761, 52428800, 209715200 bytes with Content-Length | Not stored; full byte count and SHA256 match | `payload_sizes_cache_below_limit_and_stream_larger_bodies_intact` |
 | Cacheable chunked response without Content-Length | Stored; 4 MiB malloc storage evicts oldest objects without crashing | `chunked_objects_cache_and_small_storage_evicts_without_crashing` |
+| 100,000 objects of 2 KiB into 64 MiB storage | LRU evicts; memory peak stays below the chart minimum limit (240Mi); no OOM kill | `small_objects_past_storage_evict_within_the_chart_minimum_memory` |
+| 9 MiB response after small objects fill storage | Delivered whole; no `n_lru_limited` | `large_object_after_small_objects_fill_storage_is_delivered_whole` |
 | text/event-stream | Never stored; first bytes precede origin completion | `event_streams_deliver_progressively_and_never_store` |
 
 The complete header matrix runs against both generic and mesh templates. Focused tests use the generic template.

@@ -1036,3 +1036,98 @@ async fn concurrent_slow_clients_of_large_pass_bodies_stay_within_memory() {
         "Transient is released once the load ends"
     );
 }
+
+const SMALL_BODY: usize = 2 * 1024;
+
+/// Fills the cache with distinct small objects over 32 keep-alive connections; panics on any non-200.
+async fn fill_small(f: &Fixture, from: usize, count: usize) {
+    const WORKERS: usize = 32;
+    let mut route = Route::headers(&[("cache-control", "max-age=600")]);
+    route.body = Some(Bytes::from(vec![b's'; SMALL_BODY]));
+    route
+        .headers
+        .push(("content-length".into(), SMALL_BODY.to_string()));
+    f.origin.set_fallback(route);
+    let traffic = f.cache.traffic;
+    let workers = (0..WORKERS).map(|worker| async move {
+        let stream = tokio::net::TcpStream::connect(traffic).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        let _driver = Driver(tokio::spawn(async move {
+            let _ = conn.await;
+        }));
+        for n in (from + worker..from + count).step_by(WORKERS) {
+            let req = Request::builder()
+                .uri(format!("/small-{n}"))
+                .header("host", "catalog.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            sender.ready().await.unwrap();
+            let response = sender.send_request(req).await.unwrap();
+            assert_eq!(response.status(), 200, "/small-{n}");
+            response.into_body().collect().await.unwrap();
+        }
+    });
+    futures_util::future::join_all(workers).await;
+}
+
+fn memory_peak(id: &str) -> u64 {
+    docker(&["exec", id, "cat", "/sys/fs/cgroup/memory.peak"])
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker"]
+async fn large_object_after_small_objects_fill_storage_is_delivered_whole() {
+    let f = fixture("nuke-limit", Profile::Generic, "malloc,64m", false).await;
+    fill_small(&f, 0, 40_000).await;
+    assert!(stat(&f.cache.id, "MAIN.n_lru_nuked") > 0, "storage is full");
+    const BIG: usize = 9 * MIB;
+    let mut route = Route::headers(&[("cache-control", "max-age=600")]);
+    route
+        .headers
+        .push(("content-length".into(), BIG.to_string()));
+    route.size = Some(BIG);
+    f.origin.set("/big", route);
+    let received = throttled(f.cache.traffic, "/big", usize::MAX).await;
+    // With Varnish's default nuke_limit of 50 the fetch gives up mid-stream and the body is cut.
+    assert_eq!(received, Ok((BIG, checksum(BIG))));
+    assert_eq!(stat(&f.cache.id, "MAIN.n_lru_limited"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker"]
+async fn small_objects_past_storage_evict_within_the_chart_minimum_memory() {
+    // The chart minimum for 64m storage, 16m transient and 32768 objects (64 MiB of 2 KiB ones):
+    // storage + transient + 128 MiB base + 1 KiB per object.
+    const LIMIT: u64 = (64 + 16 + 128 + 32) * MIB as u64;
+    let docker_extra = [
+        format!("--memory={LIMIT}"),
+        format!("--memory-swap={LIMIT}"),
+    ];
+    let f = fixture_with(
+        "small-objects",
+        Profile::Generic,
+        "malloc,64m",
+        false,
+        &docker_extra,
+        &["--transient-storage=malloc,16m".into()],
+    )
+    .await;
+    fill_small(&f, 0, 100_000).await;
+    let peak = memory_peak(&f.cache.id);
+    assert!(stat(&f.cache.id, "MAIN.n_lru_nuked") > 50_000, "LRU evicts");
+    assert_eq!(
+        docker(&[
+            "inspect",
+            "-f",
+            "{{.State.Running}} {{.State.OOMKilled}} {{.RestartCount}}",
+            &f.cache.id
+        ]),
+        "true false 0"
+    );
+    assert!(peak < LIMIT, "memory peak {peak}");
+    assert_eq!(stat(&f.cache.id, "MAIN.n_lru_limited"), 0);
+}

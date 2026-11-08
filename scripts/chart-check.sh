@@ -29,6 +29,9 @@ expect 'resources: ["cachepolicies/status"]'
 expect 'resources: ["virtualservices"]'
 expect 'kind: CachePolicy'
 expect 'name: STALEWISE_MAX_CACHE_POLICIES'
+expect '{"concurrency":4,"holdApplicationUntilProxyStarts":true,"terminationDrainDuration":"15s"}'
+expect 'sidecar.istio.io/proxyCPU: 500m'
+expect 'sidecar.istio.io/proxyCPULimit: "4"'
 if grep -qE 'verbs: .*"(create|delete)"' "$out"; then fail "the Role must not grant writes"; fi
 validate "$out"
 
@@ -37,6 +40,8 @@ expect 'name: catalog-cache-stalewise'
 expect 'value: "malloc,64m"'
 expect 'value: "1048576"'
 expect 'memory: 512Mi'
+expect 'value: "10000"'
+if grep -qF 'sidecar.istio.io/proxyCPU' "$out"; then fail "sidecar CPU annotations rendered without mesh.proxy"; fi
 expect 'terminationGracePeriodSeconds: 45'
 expect 'value: "10s"'
 if grep -qF 'cachepolicies' "$out"; then fail "policy RBAC rendered while cachePolicies is disabled"; fi
@@ -81,4 +86,20 @@ if helm template catalog-cache "$chart" --namespace apps --set backend.service=c
   --set drainDelay=30 >/dev/null 2>&1; then
   fail "drainDelay not shorter than shutdownTimeout rendered"
 fi
+
+# Memory limit: derived from storage and capacity.maxObjects, never below their minimum.
+helm template catalog-cache "$chart" --namespace apps --set backend.service=catalog \
+  --set 'storage=malloc\,500m' --set capacity.maxObjects=256000 >"$out"
+expect 'memory: 942Mi'
+# refuses <expected error> <helm args...>: rendering must fail with that message.
+refuses() {
+  local why="$1"; shift
+  if helm template catalog-cache "$chart" --namespace apps "$@" >"$work/err" 2>&1; then fail "rendered despite: $why"; fi
+  grep -qF -- "$why" "$work/err" || fail "wrong error, want '$why': $(cat "$work/err")"
+}
+refuses "is below the 272Mi" --set backend.service=catalog \
+  --set 'storage=malloc\,64m' --set 'transientStorage=malloc\,16m' --set resources.limits.memory=192Mi
+refuses "must be an integer quantity" --set backend.service=catalog --set resources.limits.memory=0.5Gi
+refuses "exceeds the sidecar CPU limit of 2 cores" -f "$chart/values-mesh.yaml" --set mesh.proxy.cpuLimit=2
+refuses "needs mesh.proxy.cpuLimit" -f "$chart/values-mesh.yaml" --set mesh.proxy.cpuLimit=
 echo "chart-check: ok"

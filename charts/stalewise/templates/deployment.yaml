@@ -31,8 +31,8 @@ spec:
         {{- if .Values.template.inline }}
         checksum/template: {{ .Values.template.inline | sha256sum }}
         {{- end }}
-        {{- with .Values.podAnnotations }}
-        {{- toYaml . | nindent 8 }}
+        {{- with (include "stalewise.podAnnotations" .) }}
+        {{- . | nindent 8 }}
         {{- end }}
     spec:
       serviceAccountName: {{ include "stalewise.serviceAccountName" . }}
@@ -120,6 +120,8 @@ spec:
               value: {{ .Values.transientStorage | quote }}
             - name: STALEWISE_TRANSIT_BUFFER
               value: {{ .Values.transitBuffer | int64 | toString | quote }}
+            - name: STALEWISE_NUKE_LIMIT
+              value: {{ .Values.nukeLimit | int64 | toString | quote }}
             - name: STALEWISE_MAX_VCLS
               value: {{ .Values.maxVcls | int64 | toString | quote }}
             - name: STALEWISE_UNCACHEABLE_TTL
@@ -230,10 +232,8 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          {{- with .Values.resources }}
           resources:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
+            {{- include "stalewise.resources" . | nindent 12 }}
           volumeMounts:
             - name: work
               mountPath: /var/lib/stalewise

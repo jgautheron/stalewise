@@ -320,6 +320,28 @@
         "trustDomain": {
           "type": "string",
           "minLength": 1
+        },
+        "proxy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "concurrency": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "cpuRequest": {
+              "type": [
+                "string",
+                "number"
+              ]
+            },
+            "cpuLimit": {
+              "type": [
+                "string",
+                "number"
+              ]
+            }
+          }
         }
       }
     },
@@ -435,6 +457,20 @@
       "type": "array",
       "items": {
         "type": "string"
+      }
+    },
+    "nukeLimit": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxObjects": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     }
   },

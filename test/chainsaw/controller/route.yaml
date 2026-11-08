@@ -1,0 +1,25 @@
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: catalog
+spec:
+  hosts: [catalog]
+  http:
+    - match:
+        - sourceLabels:
+            app.kubernetes.io/name: stalewise
+            app.kubernetes.io/instance: cache
+      route:
+        - destination: {host: catalog, port: {number: 8080}}
+    - match:
+        - headers:
+            x-stalewise-bypass: {exact: 'true'}
+      route:
+        - destination: {host: catalog, port: {number: 8080}}
+    - match:
+        - method: {exact: GET}
+        - method: {exact: HEAD}
+      route:
+        - destination: {host: cache, port: {number: 8080}}
+    - route:
+        - destination: {host: catalog, port: {number: 8080}}

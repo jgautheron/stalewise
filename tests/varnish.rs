@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -15,42 +15,11 @@ use hyper::{Request, Response, StatusCode};
 use stalewise::config::Profile;
 use stalewise::http::{self, Body, Limits};
 use stalewise::render::Template;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-const TOKEN: &str = "integration-token-0123456789abcdef";
-
-fn image() -> String {
-    std::env::var("STALEWISE_IMAGE").unwrap_or_else(|_| "stalewise:it".into())
-}
-
-fn docker(args: &[&str]) -> String {
-    let out = Command::new("docker")
-        .args(args)
-        .output()
-        .expect("docker runs");
-    assert!(
-        out.status.success(),
-        "docker {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-fn build_image_once() {
-    static BUILT: std::sync::Once = std::sync::Once::new();
-    BUILT.call_once(|| {
-        if std::env::var("STALEWISE_IMAGE").is_err() {
-            docker(&[
-                "build",
-                "-q",
-                "-t",
-                "stalewise:it",
-                env!("CARGO_MANIFEST_DIR"),
-            ]);
-        }
-    });
-}
+#[allow(dead_code)]
+mod common;
+use common::*;
 
 /// Origin state: per-path hit counts, Host and raw targets seen, and paths forced to 500.
 #[derive(Default)]
@@ -198,198 +167,8 @@ async fn start_origin() -> (u16, SharedOrigin) {
     (port, origin)
 }
 
-struct Reply {
-    status: u16,
-    headers: HashMap<String, String>,
-    body: String,
-}
-
-impl Reply {
-    fn is_hit(&self) -> bool {
-        self.headers
-            .get("x-varnish")
-            .is_some_and(|v| v.split_whitespace().count() == 2)
-    }
-}
-
-async fn request(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply {
-    try_request(addr, method, path, extra).await.unwrap()
-}
-
-/// Readiness probes use this: Docker's port proxy accepts and then resets until the listener is up.
-async fn try_request(
-    addr: SocketAddr,
-    method: &str,
-    path: &str,
-    extra: &str,
-) -> std::io::Result<Reply> {
-    let mut stream = tokio::net::TcpStream::connect(addr).await?;
-    let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: Catalog.Test\r\nConnection: close\r\n{extra}Content-Length: 0\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes()).await?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await?;
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
-    let mut lines = head.lines();
-    let status = lines
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let headers = lines
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
-        .collect();
-    Ok(Reply {
-        status,
-        headers,
-        body: body.to_owned(),
-    })
-}
-
-fn mapped(container: &str, port: &str) -> SocketAddr {
-    let out = docker(&["port", container, port]);
-    let first = out
-        .lines()
-        .find(|l| l.starts_with("127.0.0.1"))
-        .unwrap_or_default();
-    first.parse().unwrap()
-}
-
-async fn wait_for(what: &str, timeout: Duration, mut check: impl AsyncFnMut() -> bool) {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if check().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
-struct Container {
-    id: String,
-    traffic: SocketAddr,
-    management: SocketAddr,
-    signaller: SocketAddr,
-}
-
-impl Drop for Container {
-    fn drop(&mut self) {
-        let _ = Command::new("docker").args(["rm", "-f", &self.id]).output();
-    }
-}
-
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("stalewise-it-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    dir
-}
-
-async fn run_cache(config_dir: &Path, args: &[String]) -> Container {
-    run_cache_with(config_dir, &[], args).await
-}
-
-async fn run_cache_with(config_dir: &Path, docker_extra: &[String], args: &[String]) -> Container {
-    build_image_once();
-    let mount = format!("{}:/config:ro", config_dir.display());
-    let mut argv: Vec<String> = [
-        "run",
-        "-d",
-        "--read-only",
-        "--tmpfs",
-        "/var/lib/stalewise:uid=1000,gid=1000,mode=0700",
-        "--tmpfs",
-        "/var/lib/varnish:uid=1000,gid=1000,mode=0755,exec",
-        "--tmpfs",
-        "/tmp:mode=1777,exec",
-        "--add-host",
-        "host.docker.internal:host-gateway",
-        "-p",
-        "127.0.0.1::8080",
-        "-p",
-        "127.0.0.1::8081",
-        "-p",
-        "127.0.0.1::9090",
-        "-v",
-        &mount,
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect();
-    argv.extend_from_slice(docker_extra);
-    argv.push(image());
-    argv.extend_from_slice(args);
-    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let id = docker(&refs);
-    let c = Container {
-        traffic: mapped(&id, "8080/tcp"),
-        signaller: mapped(&id, "8081/tcp"),
-        management: mapped(&id, "9090/tcp"),
-        id,
-    };
-    let management = c.management;
-    let id = c.id.clone();
-    wait_for("readiness", Duration::from_secs(90), async || {
-        let state = docker(&["inspect", "-f", "{{.State.Running}}", &id]);
-        assert_eq!(state, "true", "container exited: {}", logs(&id));
-        try_request(management, "GET", "/readyz", "")
-            .await
-            .is_ok_and(|r| r.status == 200)
-    })
-    .await;
-    c
-}
-
-fn logs(id: &str) -> String {
-    let out = Command::new("docker").args(["logs", id]).output().unwrap();
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
-}
-
-fn base_args(origin_port: u16) -> Vec<String> {
-    [
-        "--frontend-service=cache-peers",
-        "--frontend-service-host=cache.test",
-        "--backend-watch=false",
-        "--backend-host=host.docker.internal",
-        "--signaller",
-        "--signaller-token-file=/config/token",
-        "--pod-ip=10.255.255.1",
-        "--pod-name=cache-it",
-        "--log-level=info",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .chain([format!("--backend-port={origin_port}")])
-    .collect()
-}
-
-async fn warm(addr: SocketAddr) {
-    wait_for("origin health", Duration::from_secs(30), async || {
-        request(addr, "GET", "/", "").await.status == 200
-    })
-    .await;
-}
-
 fn hits(origin: &SharedOrigin, path: &str) -> usize {
     origin.lock().unwrap().hits.get(path).copied().unwrap_or(0)
-}
-
-async fn metric(addr: SocketAddr, name: &str) -> f64 {
-    let body = request(addr, "GET", "/metrics", "").await.body;
-    body.lines()
-        .find(|l| l.starts_with(name))
-        .and_then(|l| l.rsplit(' ').next())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.0)
 }
 
 #[tokio::test(flavor = "multi_thread")]

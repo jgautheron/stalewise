@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: origin
+data:
+  default.vcl: |
+    vcl 4.1;
+    backend default none;
+    sub vcl_recv { return (synth(200)); }
+    sub vcl_synth {
+      set resp.http.Cache-Control = "max-age=60";
+      set resp.body = "origin fixture";
+      return (deliver);
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: origin
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: origin}
+  template:
+    metadata:
+      labels: {app: origin}
+    spec:
+      containers:
+        - name: origin
+          image: STALEWISE_TEST_IMAGE
+          imagePullPolicy: Never
+          command: [varnishd]
+          args: [-F, -n, /tmp/origin, -a, ':8080', -f, /config/default.vcl, -s, 'malloc,8m']
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /, port: http}
+          volumeMounts:
+            - {name: config, mountPath: /config}
+      volumes:
+        - name: config
+          configMap: {name: origin}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog
+spec:
+  selector: {app: origin}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

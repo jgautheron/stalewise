@@ -1,0 +1,118 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: controller
+spec:
+  steps:
+    - name: install-default-mesh-and-shard
+      try:
+        - script:
+            env: &namespace
+              - name: NAMESPACE
+                value: ($namespace)
+            content: bash "$STALEWISE_ROOT/test/chainsaw/controller/check.sh" install "$NAMESPACE"
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata: {name: cache}
+              status:
+                availableReplicas: 2
+                readyReplicas: 2
+        - assert:
+            resource:
+              apiVersion: policy/v1
+              kind: PodDisruptionBudget
+              metadata: {name: cache}
+              spec: {maxUnavailable: 1}
+        - assert:
+            resource:
+              apiVersion: security.istio.io/v1
+              kind: AuthorizationPolicy
+              metadata: {name: mesh-invalidation}
+        - assert:
+            resource:
+              apiVersion: security.istio.io/v1
+              kind: PeerAuthentication
+              metadata: {name: mesh}
+              spec:
+                mtls: {mode: STRICT}
+    - name: policy-active-and-attached
+      try:
+        - apply: {file: route.yaml}
+        - apply: {file: policy.yaml}
+        - assert:
+            resource:
+              apiVersion: stalewise.dev/v1alpha1
+              kind: CachePolicy
+              metadata: {name: catalog}
+              status:
+                (conditions[?type == 'Accepted']):
+                  - {type: Accepted, status: 'True', reason: Active}
+                (conditions[?type == 'Invalid']):
+                  - {type: Invalid, status: 'False'}
+                (conditions[?type == 'Attached']):
+                  - {type: Attached, status: 'True', reason: Attached}
+    - name: attachment-fails-and-recovers
+      try:
+        - script:
+            env: *namespace
+            content: bash "$STALEWISE_ROOT/test/chainsaw/controller/check.sh" break-attachment "$NAMESPACE"
+        - assert:
+            resource:
+              apiVersion: stalewise.dev/v1alpha1
+              kind: CachePolicy
+              metadata: {name: catalog}
+              status:
+                (conditions[?type == 'Attached']):
+                  - {type: Attached, status: 'False', reason: MissingSourceBypass}
+        - apply: {file: route.yaml}
+        - assert:
+            resource:
+              apiVersion: stalewise.dev/v1alpha1
+              kind: CachePolicy
+              metadata: {name: catalog}
+              status:
+                (conditions[?type == 'Attached']):
+                  - {type: Attached, status: 'True', reason: Attached}
+    - name: conflicts-are-invalid
+      try:
+        - script:
+            env: *namespace
+            content: bash "$STALEWISE_ROOT/test/chainsaw/controller/check.sh" conflict "$NAMESPACE"
+        - assert:
+            resource:
+              apiVersion: stalewise.dev/v1alpha1
+              kind: CachePolicy
+              metadata: {name: catalog}
+              status:
+                (conditions[?type == 'Accepted']):
+                  - {type: Accepted, status: 'False', reason: Conflict}
+                (conditions[?type == 'Invalid']):
+                  - {type: Invalid, status: 'True', reason: Conflict}
+        - assert:
+            resource:
+              apiVersion: stalewise.dev/v1alpha1
+              kind: CachePolicy
+              metadata: {name: conflicting}
+              status:
+                (conditions[?type == 'Accepted']):
+                  - {type: Accepted, status: 'False', reason: Conflict}
+                (conditions[?type == 'Invalid']):
+                  - {type: Invalid, status: 'True', reason: Conflict}
+        - script:
+            env: *namespace
+            content: kubectl -n "$NAMESPACE" delete cachepolicy conflicting
+        - assert:
+            resource:
+              apiVersion: stalewise.dev/v1alpha1
+              kind: CachePolicy
+              metadata: {name: catalog}
+              status:
+                (conditions[?type == 'Accepted']):
+                  - {type: Accepted, status: 'True', reason: Active}
+    - name: admission-many-policies-and-read-only-routes
+      try:
+        - script:
+            env: *namespace
+            content: bash "$STALEWISE_ROOT/test/chainsaw/controller/check.sh" policies "$NAMESPACE"

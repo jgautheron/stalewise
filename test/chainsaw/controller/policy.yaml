@@ -1,0 +1,9 @@
+apiVersion: stalewise.dev/v1alpha1
+kind: CachePolicy
+metadata:
+  name: catalog
+spec:
+  serviceRef: {name: catalog}
+  pathPrefix: /
+  overrides: {ttlSeconds: 60}
+  attach: {mode: route}

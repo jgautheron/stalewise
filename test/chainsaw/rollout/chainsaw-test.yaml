@@ -1,0 +1,20 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: rollout
+spec:
+  steps:
+    - name: install
+      try:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: bash "$STALEWISE_ROOT/test/chainsaw/controller/check.sh" install "$NAMESPACE"
+    - name: rollout-keeps-serving
+      try:
+        - script:
+            env:
+              - name: NAMESPACE
+                value: ($namespace)
+            content: bash "$STALEWISE_ROOT/test/chainsaw/controller/check.sh" rollout "$NAMESPACE"

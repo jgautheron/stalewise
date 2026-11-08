@@ -72,4 +72,17 @@ jobs:
       - name: Real varnishd tests
         env:
           STALEWISE_IMAGE: stalewise:it
-        run: cargo test --locked --test varnish -- --ignored --test-threads=1
+        run: cargo test --locked --test varnish --test cache_semantics -- --ignored --test-threads=1
+
+  chainsaw:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Build local image
+        run: docker build -t stalewise:tests .
+      - name: Kubernetes lifecycle and policy checks
+        env:
+          CHAINSAW_REPORT_DIR: ${{ runner.temp }}/chainsaw
+        run: scripts/chainsaw.sh

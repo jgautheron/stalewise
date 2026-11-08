@@ -29,7 +29,7 @@ Privacy constraints dominate all freshness configuration: Set-Cookie, private, n
 
 Freshness comes from Surrogate-Control when present, otherwise Cache-Control. Prefer s-maxage over max-age. For Cache-Control, retain Varnish's native Age/Date/Expires calculation when valid. No freshness information means TTL zero, not the Varnish default. A present Surrogate-Control without valid freshness also means zero; do not silently reuse Cache-Control freshness.
 
-Preserve the original client-facing Cache-Control. Remove Surrogate-Control and internal metadata before delivery. Validate directives case-insensitively, using complete comma-delimited names. Reject duplicate/conflicting or malformed numeric directives conservatively. Do not match text inside unrelated extension values. Unknown extensions do not enable caching.
+Preserve the original client-facing Cache-Control. Remove Surrogate-Control and internal metadata before delivery. Validate directives case-insensitively, using complete comma-delimited names. Reject duplicate/conflicting or malformed numeric directives conservatively. Do not match text inside unrelated extension values. Unknown extensions do not enable caching. The conservative parser treats quoted commas as uncacheable, including otherwise valid extension values.
 
 Explicitly set default TTL, grace, and keep to zero in generated VCL and process parameters. Header freshness may raise TTL. Keep defaults to zero until policy overrides it. Use native cacheable status handling; unexpected statuses cannot gain storage merely by carrying max-age.
 

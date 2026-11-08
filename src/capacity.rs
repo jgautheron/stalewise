@@ -13,6 +13,10 @@ const TIGHT_OBJECT_SIZE: u64 = 4 * 1024;
 const MIB: u64 = 1024 * 1024;
 const CGROUP_V2: &str = "/sys/fs/cgroup/memory.max";
 const CGROUP_V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+const USAGE_V2: &str = "sys/fs/cgroup/memory.current";
+const STAT_V2: &str = "sys/fs/cgroup/memory.stat";
+const USAGE_V1: &str = "sys/fs/cgroup/memory/memory.usage_in_bytes";
+const STAT_V1: &str = "sys/fs/cgroup/memory/memory.stat";
 /// cgroup v1 reports "unlimited" as a page-aligned value near `i64::MAX`.
 const UNLIMITED_V1: u64 = 1 << 60;
 
@@ -81,6 +85,40 @@ pub fn cgroup_limit(root: &Path) -> Option<u64> {
         .parse()
         .ok()?;
     (v1 < UNLIMITED_V1).then_some(v1)
+}
+
+/// Container memory use as the kubelet sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    /// Raw cgroup usage, page cache included.
+    pub current: u64,
+    /// `current` minus reclaimable inactive page cache; what OOM and eviction act on.
+    pub working_set: u64,
+}
+
+/// Reads cgroup v2 `memory.current`, then v1 `memory.usage_in_bytes`; `None` when unreadable.
+pub fn cgroup_usage(root: &Path) -> Option<Usage> {
+    let read = |path: &str| std::fs::read_to_string(root.join(path)).ok();
+    let (current, stat, key) = match read(USAGE_V2) {
+        Some(current) => (current, read(STAT_V2), "inactive_file"),
+        None => (read(USAGE_V1)?, read(STAT_V1), "total_inactive_file"),
+    };
+    let current: u64 = current.trim().parse().ok()?;
+    let inactive = stat
+        .as_deref()
+        .and_then(|s| stat_field(s, key))
+        .unwrap_or(0);
+    Some(Usage {
+        current,
+        working_set: current.saturating_sub(inactive),
+    })
+}
+
+fn stat_field(stat: &str, key: &str) -> Option<u64> {
+    stat.lines()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(name, _)| *name == key)
+        .and_then(|(_, value)| value.trim().parse().ok())
 }
 
 /// Compares the stores plus the base overhead with `limit`; errors when they cannot fit.
@@ -186,5 +224,33 @@ mod tests {
         assert_eq!(cgroup_limit(&root), None, "v2 unlimited wins over v1");
         std::fs::write(root.join(CGROUP_V2.trim_start_matches('/')), "536870912\n").unwrap();
         assert_eq!(cgroup_limit(&root), Some(512 * MIB));
+    }
+
+    #[test]
+    fn working_set_excludes_inactive_page_cache() {
+        let root = crate::testutil::temp_dir("usage");
+        assert_eq!(cgroup_usage(&root), None, "no cgroup files");
+        let v1 = root.join(USAGE_V1);
+        std::fs::create_dir_all(v1.parent().unwrap()).unwrap();
+        std::fs::write(&v1, "1000\n").unwrap();
+        std::fs::write(root.join(STAT_V1), "cache 5\ntotal_inactive_file 300\n").unwrap();
+        let usage = cgroup_usage(&root).unwrap();
+        assert_eq!((usage.current, usage.working_set), (1000, 700));
+        std::fs::write(root.join(USAGE_V2), "2000\n").unwrap();
+        let usage = cgroup_usage(&root).unwrap();
+        assert_eq!(
+            usage.working_set, 2000,
+            "v2 wins; missing memory.stat counts nothing"
+        );
+        std::fs::write(
+            root.join(STAT_V2),
+            "anon 10\nactive_file 1\ninactive_file 1500\n",
+        )
+        .unwrap();
+        assert_eq!(cgroup_usage(&root).unwrap().working_set, 500);
+        std::fs::write(root.join(STAT_V2), "inactive_file 9999\n").unwrap();
+        assert_eq!(cgroup_usage(&root).unwrap().working_set, 0, "saturates");
+        std::fs::write(root.join(USAGE_V2), "garbage\n").unwrap();
+        assert_eq!(cgroup_usage(&root), None);
     }
 }

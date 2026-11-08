@@ -69,11 +69,11 @@ impl Method {
     }
 }
 
-/// Parses `250ms`, `2s` or `1m`.
+/// Parses `250ms`, `2s`, `1m` or `24h`.
 pub fn parse_duration(raw: &str) -> Result<Duration, String> {
     let split = raw
         .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| format!("{raw:?} needs a unit: ms, s or m"))?;
+        .ok_or_else(|| format!("{raw:?} needs a unit: ms, s, m or h"))?;
     let (digits, unit) = raw.split_at(split);
     let value: u64 = digits
         .parse()
@@ -85,7 +85,11 @@ pub fn parse_duration(raw: &str) -> Result<Duration, String> {
             .checked_mul(60)
             .map(Duration::from_secs)
             .ok_or_else(|| format!("{raw:?} overflows")),
-        _ => Err(format!("{raw:?} has unknown unit; use ms, s or m")),
+        "h" => value
+            .checked_mul(3600)
+            .map(Duration::from_secs)
+            .ok_or_else(|| format!("{raw:?} overflows")),
+        _ => Err(format!("{raw:?} has unknown unit; use ms, s, m or h")),
     }
 }
 
@@ -184,6 +188,26 @@ pub struct Cli {
     /// response once storage is full of small objects.
     #[arg(long, env = "STALEWISE_NUKE_LIMIT", default_value_t = 10_000)]
     pub nuke_limit: u32,
+    /// Bans the longest-cached objects when the container working set nears its memory limit.
+    #[arg(long, env = "STALEWISE_MEMGUARD", num_args = 0..=1, default_missing_value = "true", default_value = "true", action = ArgAction::Set)]
+    pub memguard: bool,
+    #[arg(long, env = "STALEWISE_MEMGUARD_INTERVAL", value_parser = parse_duration, default_value = "1s")]
+    pub memguard_interval: Duration,
+    /// Fraction of the memory limit that starts eviction.
+    #[arg(long, env = "STALEWISE_MEMGUARD_HIGH", default_value_t = 0.85)]
+    pub memguard_high: f64,
+    /// Fraction of the memory limit that ends eviction.
+    #[arg(long, env = "STALEWISE_MEMGUARD_LOW", default_value_t = 0.75)]
+    pub memguard_low: f64,
+    /// Objects cached for less than this are never banned by the guard.
+    #[arg(long, env = "STALEWISE_MEMGUARD_MIN_AGE", value_parser = parse_duration, default_value = "10s")]
+    pub memguard_min_age: Duration,
+    /// The first ban's age cap; later bans halve it.
+    #[arg(long, env = "STALEWISE_MEMGUARD_MAX_AGE", value_parser = parse_duration, default_value = "24h")]
+    pub memguard_max_age: Duration,
+    /// Caps glibc malloc arenas in varnishd (MALLOC_ARENA_MAX); 0 keeps glibc's default.
+    #[arg(long, env = "STALEWISE_MALLOC_ARENA_MAX", default_value_t = 4)]
+    pub malloc_arena_max: u32,
     #[arg(long, env = "STALEWISE_VARNISH_PARAM", value_delimiter = ',', action = ArgAction::Append)]
     pub varnish_param: Vec<String>,
     #[arg(long, env = "STALEWISE_MAX_VCLS", default_value_t = 5)]
@@ -404,6 +428,8 @@ pub struct Config {
     pub transit_buffer: u64,
     pub nuke_limit: u32,
     pub varnish_params: Vec<VarnishParam>,
+    pub memguard: Option<MemguardConfig>,
+    pub malloc_arena_max: Option<u32>,
     pub max_vcls: usize,
     pub startup_timeout: Duration,
     pub shutdown_timeout: Duration,
@@ -421,6 +447,16 @@ pub struct Config {
     pub strip_rewrite_headers: bool,
     pub log_level: String,
     pub policies: Option<PolicyConfig>,
+}
+
+/// The memory-pressure watchdog; `high` and `low` are fractions of the memory limit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemguardConfig {
+    pub interval: Duration,
+    pub high: f64,
+    pub low: f64,
+    pub min_age: Duration,
+    pub max_age: Duration,
 }
 
 /// CachePolicy watching for one cached Service.
@@ -597,6 +633,7 @@ impl Config {
         let policies = policy_config(&cli, &backend, &namespace)?;
         let signaller = signal_config(&cli, canonical_host.clone())?;
         let shard = shard_config(&cli)?;
+        let memguard = memguard_config(&cli)?;
         Ok(Self {
             profile: cli.profile,
             frontend,
@@ -620,6 +657,8 @@ impl Config {
             transit_buffer: cli.transit_buffer,
             nuke_limit: cli.nuke_limit,
             varnish_params: varnish_params(&cli.varnish_param)?,
+            memguard,
+            malloc_arena_max: (cli.malloc_arena_max > 0).then_some(cli.malloc_arena_max),
             max_vcls: at_least_one("--max-vcls", cli.max_vcls)?,
             startup_timeout: positive("--startup-timeout", cli.startup_timeout)?,
             shutdown_timeout: positive("--shutdown-timeout", cli.shutdown_timeout)?,
@@ -647,6 +686,33 @@ impl Config {
             log_level: cli.log_level,
         })
     }
+}
+
+fn memguard_config(cli: &Cli) -> Result<Option<MemguardConfig>, ConfigError> {
+    if !cli.memguard {
+        return Ok(None);
+    }
+    let (high, low) = (cli.memguard_high, cli.memguard_low);
+    if !(0.0 < low && low < high && high < 1.0) {
+        return Err(invalid(
+            "--memguard-low",
+            "needs 0 < --memguard-low < --memguard-high < 1",
+        ));
+    }
+    let min_age = positive("--memguard-min-age", cli.memguard_min_age)?;
+    if cli.memguard_max_age < min_age {
+        return Err(invalid(
+            "--memguard-max-age",
+            "must be at least --memguard-min-age",
+        ));
+    }
+    Ok(Some(MemguardConfig {
+        interval: positive("--memguard-interval", cli.memguard_interval)?,
+        high,
+        low,
+        min_age,
+        max_age: cli.memguard_max_age,
+    }))
 }
 
 fn drain_delay(delay: Duration, shutdown: Duration) -> Result<Duration, ConfigError> {
@@ -1105,6 +1171,28 @@ mod tests {
     }
 
     #[test]
+    fn memguard_marks_must_be_ordered_fractions() {
+        let with = |extra: &[&str]| parse(&[&BASE[..], extra].concat());
+        let guard = with(&[]).unwrap().memguard.unwrap();
+        assert_eq!((guard.high, guard.low), (0.85, 0.75));
+        assert_eq!(guard.max_age, Duration::from_secs(86_400));
+        assert!(with(&["--memguard=false"]).unwrap().memguard.is_none());
+        for bad in [
+            &["--memguard-high=0.7"][..],
+            &["--memguard-high=1.0"],
+            &["--memguard-low=0"],
+            &["--memguard-min-age=0s"],
+            &["--memguard-max-age=5s"],
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
+        }
+        assert!(
+            with(&["--memguard=false", "--memguard-high=0.1"]).is_ok(),
+            "a disabled guard ignores its marks"
+        );
+    }
+
+    #[test]
     fn drain_delay_must_fit_inside_the_shutdown_timeout() {
         let with = |extra: &[&str]| parse(&[&BASE[..], extra].concat());
         assert_eq!(with(&[]).unwrap().drain_delay, Duration::from_secs(10));
@@ -1488,7 +1576,8 @@ signaller: false
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
         assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
         assert!(parse_duration("2").is_err());
-        assert!(parse_duration("2h").is_err());
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+        assert!(parse_duration("2d").is_err());
         assert!(parse_duration("-1s").is_err());
     }
 }

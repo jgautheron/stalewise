@@ -463,6 +463,37 @@
       "type": "integer",
       "minimum": 1
     },
+    "memguard": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "high": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "low": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "minAge": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m|h)$"
+        },
+        "interval": {
+          "type": "string",
+          "pattern": "^[0-9]+(ms|s|m|h)$"
+        }
+      }
+    },
+    "mallocArenaMax": {
+      "type": "integer",
+      "minimum": 0
+    },
     "capacity": {
       "type": "object",
       "additionalProperties": false,

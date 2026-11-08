@@ -341,12 +341,52 @@ Worked example: 500m of storage filled with 2 KiB objects holds about 256,000 ob
 Set `storage: malloc,500m` and `capacity.maxObjects: 256000`.
 The limit is then 500 + 64 + 128 + 250 = 942Mi.
 
-Each evicted object leaves an object head of about 0.5 KiB, which Varnish frees up to about 6 minutes later (`critbit_cooloff`).
-A cache that evicts thousands of objects per second needs more headroom: add evictions per second x 360 s x 0.5 KiB.
+Each evicted object leaves an object head of about 0.5 KiB, which Varnish frees two `critbit_cooloff` periods later.
+The memory guard lowers `critbit_cooloff` from 180s to Varnish's minimum of 60s, so this is about 2 minutes, or 6 minutes with the guard disabled.
+A cache that evicts thousands of objects per second needs more headroom: add evictions per second x 120 s (360 s without the guard) x 0.5 KiB.
 Watch `MAIN.n_lru_nuked` to estimate the rate.
 
 At startup, stalewise reads the cgroup memory limit and compares it with the stores plus the 128 MiB base.
 It refuses to start when they do not fit, and it logs a warning when the remaining headroom holds fewer objects than storage filled with 4 KiB objects.
+
+varnishd runs with `MALLOC_ARENA_MAX=4` (`--malloc-arena-max`, chart `mallocArenaMax`; 0 keeps the glibc default).
+The `varnish:9.1.0` image uses glibc malloc, not jemalloc.
+Filling 64m of storage with 150,000 objects of 2 KiB peaked at 316 MB with glibc's default arenas and at 240 MB with 4 arenas, at the same request rate.
+Disabling transparent huge pages made no measurable difference, so stalewise leaves them alone.
+
+### Memory guard
+
+The sizing formula is the primary protection; the memory guard is a safety net for when the object count outgrows it.
+Open-source Varnish has no memory governor: its LRU bounds only the stevedore bytes, not the per-object overhead outside them.
+
+Every `--memguard-interval` (default 1s), stalewise reads the container working set: cgroup `memory.current` minus `inactive_file`, the value Kubernetes uses for OOM decisions and eviction.
+Reclaimable page cache, such as the shared log on a disk-backed volume, therefore never triggers it.
+When the working set reaches `--memguard-high` (default 0.85) of the memory limit, stalewise issues `ban obj.age > T` on the local admin port.
+
+- The first T is half the age of the oldest possible object, capped at `--memguard-max-age` (default 24h). stalewise derives that age from the varnishd start time and its own earlier bans, so no object listing is needed.
+- Each further ban halves T, down to `--memguard-min-age` (default 10s). Objects younger than the floor are never banned by the guard.
+- The guard issues at most one ban every 3 seconds (or every interval, if longer), so the ban lurker has time to evict before the next step.
+- A further ban needs the working set to have grown by 0.5% of the limit since the previous ban. glibc keeps freed memory for reuse instead of returning it, so a flat working set means the last ban is working.
+- The episode ends when the working set falls below `--memguard-low` (default 0.75).
+
+Know these semantics before relying on the guard:
+
+- Eviction is by time in cache, not true LRU: a popular object that was stored long ago goes before an unpopular recent one. `obj.age` also counts any `Age` the origin sent.
+- Memory frees gradually. The lurker evicts objects within seconds, but glibc reuses the freed memory rather than returning it, and evicted hash entries linger for about 2 minutes (`critbit_cooloff`). The working set can stay above low water after the guard has stopped growth.
+- Varnish tests a ban lazily, so an object that ages past T before the lurker reaches it is banned too. With `ban_lurker_age=1`, set when the guard is enabled, that drift is about one to two seconds beyond T.
+- A ban removes stale objects kept for grace or `stale-if-error`, and copies that a non-owner keeps in shard mode. Requests for them refetch through the normal path.
+- The guard acts on its own pod only. It never uses the signaller and never reaches peers.
+- Bans touch only stored objects, never fetches in progress, so they cannot truncate a response.
+- Each guard ban uses only `obj.*` fields, so the lurker completes and removes it, and Varnish's `ban_dups` drops older identical bans. The ban list stays short.
+
+Under sustained growth the guard steps down to the floor and keeps about the last `--memguard-min-age` of objects; the hit ratio drops instead of the pod being OOM-killed.
+A Docker test fills a 224 MiB container (64m storage, 16m Transient) with 200,000 objects of 100 bytes at 2,500 per second.
+With the guard, the working set peaked at 211 to 216 MB, below the 235 MB limit, and the newest objects still hit.
+Without it, the kernel OOM-killed varnishd after about 129,000 objects.
+
+Failures to read memory or to ban are logged, counted in `stalewise_memguard_failures_total`, and listed as a readiness degradation reason (`memory guard failing`) without failing readiness.
+Without a memory limit, the guard logs once that it is disabled.
+Disable it with `--memguard=false` (chart `memguard.enabled: false`).
 
 ## Attaching traffic with `cache.enabled`
 
@@ -384,6 +424,8 @@ To remove caching, delete the cache match and wait for route propagation before 
 | `stalewise_invalidation_peers_lagging` | none |
 | `stalewise_ready`, `stalewise_degraded` | none |
 | `stalewise_degradation_events_total` | `reason` |
+| `stalewise_memguard_bans_total`, `stalewise_memguard_failures_total`, `stalewise_memguard_active` | none |
+| `stalewise_memory_used_bytes` (working set), `stalewise_memory_cgroup_usage_bytes`, `stalewise_memory_limit_bytes` | none |
 
 stalewise does not reimplement Varnish counters.
 Run a Prometheus Varnish exporter as a sidecar through `extraContainers`.

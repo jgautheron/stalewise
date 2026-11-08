@@ -135,6 +135,12 @@ pub struct Metrics {
     pub ready: Gauge,
     pub degraded: Gauge,
     pub degradation_events: Family<ReasonLabels, Counter>,
+    pub memguard_bans: Counter,
+    pub memguard_failures: Counter,
+    pub memguard_active: Gauge,
+    pub memory_used: Gauge,
+    pub memory_usage: Gauge,
+    pub memory_limit: Gauge,
 }
 
 impl Default for Metrics {
@@ -166,6 +172,12 @@ impl Metrics {
             ready: Gauge::default(),
             degraded: Gauge::default(),
             degradation_events: Family::default(),
+            memguard_bans: Counter::default(),
+            memguard_failures: Counter::default(),
+            memguard_active: Gauge::default(),
+            memory_used: Gauge::default(),
+            memory_usage: Gauge::default(),
+            memory_limit: Gauge::default(),
         };
         let r = &mut m.registry;
         r.register(
@@ -258,6 +270,36 @@ impl Metrics {
             "degradation_events",
             "Transitions into a degraded reason",
             m.degradation_events.clone(),
+        );
+        r.register(
+            "memguard_bans",
+            "Bans the memory guard issued on the oldest objects",
+            m.memguard_bans.clone(),
+        );
+        r.register(
+            "memguard_failures",
+            "Memory guard steps that failed to read memory or ban",
+            m.memguard_failures.clone(),
+        );
+        r.register(
+            "memguard_active",
+            "1 while memory is above high water and not yet below low water",
+            m.memguard_active.clone(),
+        );
+        r.register(
+            "memory_used_bytes",
+            "Container working set: cgroup usage minus inactive page cache",
+            m.memory_used.clone(),
+        );
+        r.register(
+            "memory_cgroup_usage_bytes",
+            "Raw cgroup memory usage, reclaimable page cache included",
+            m.memory_usage.clone(),
+        );
+        r.register(
+            "memory_limit_bytes",
+            "Container memory limit; 0 when unlimited",
+            m.memory_limit.clone(),
         );
         m
     }

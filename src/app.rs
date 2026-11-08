@@ -13,6 +13,7 @@ use crate::config::{BackendSource, Config, TemplateSource};
 use crate::controller;
 use crate::discovery::{self, Discovery};
 use crate::endpoint::{Endpoint, Host};
+use crate::memguard;
 use crate::metrics::Metrics;
 use crate::mgmt::{self, ManagementConfig, StatusInputs};
 use crate::reload::{self, Active, BackendInput, Inputs, Policies, ReloadConfig};
@@ -332,11 +333,23 @@ async fn start(config: Config, root: CancellationToken) -> Result<ExitCode, Star
         nuke_limit: config.nuke_limit,
         work_dir: config.varnish_work_dir.clone(),
         params: config.varnish_params.clone(),
+        memguard: config.memguard.is_some(),
+        malloc_arena_max: config.malloc_arena_max,
         startup_timeout: config.startup_timeout,
         shutdown_timeout: config
             .shutdown_timeout
             .saturating_sub(drain_budget.max(config.drain_delay)),
     };
+    if let Some(guard) = config.memguard.clone() {
+        let inputs = memguard::Inputs {
+            admin: process_config.admin.clone(),
+            cgroup_root: PathBuf::from("/"),
+            process: process_rx.clone(),
+            metrics: Arc::clone(&shared.metrics),
+            health: shared.health.clone(),
+        };
+        tasks.spawn("memory guard", memguard::run(guard, inputs, root.clone()));
+    }
     let child_stop = CancellationToken::new();
     let mut child = tokio::spawn(process::supervise(
         process_config,

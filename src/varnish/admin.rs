@@ -199,6 +199,14 @@ impl Client {
             .map(drop)
     }
 
+    /// Bans every object cached longer than `age`, in whole seconds. The expression uses only
+    /// `obj.*`, so the ban lurker evaluates it without waiting for requests.
+    pub async fn ban_older_than(&mut self, age: Duration) -> Result<()> {
+        self.command(format!("ban obj.age > {}s\n", age.as_secs()).as_bytes())
+            .await
+            .map(drop)
+    }
+
     pub async fn list(&mut self) -> Result<Vec<VclState>> {
         let body = self.command(b"vcl.list\n").await?;
         let text =

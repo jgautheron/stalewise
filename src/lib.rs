@@ -11,6 +11,7 @@ pub mod entropy;
 pub mod http;
 pub mod ledger;
 pub mod membership;
+pub mod memguard;
 pub mod metrics;
 pub mod mgmt;
 pub mod policy;

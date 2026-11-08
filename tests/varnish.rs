@@ -507,6 +507,16 @@ async fn run_peer(dir: &Path, network: &str, ip: &str, origin_port: u16) -> Cont
 }
 
 async fn run_peer_with(dir: &Path, network: &str, ip: &str, args: Vec<String>) -> Container {
+    run_peer_docker(dir, network, ip, args, &[]).await
+}
+
+async fn run_peer_docker(
+    dir: &Path,
+    network: &str,
+    ip: &str,
+    args: Vec<String>,
+    extra: &[&str],
+) -> Container {
     let docker_extra: Vec<String> = [
         "--network",
         network,
@@ -516,6 +526,7 @@ async fn run_peer_with(dir: &Path, network: &str, ip: &str, args: Vec<String>) -
         "KUBECONFIG=/config/kubeconfig",
     ]
     .iter()
+    .chain(extra)
     .map(|s| (*s).to_owned())
     .collect();
     run_cache_with(dir, &docker_extra, &args).await
@@ -1722,4 +1733,116 @@ async fn stores_larger_than_the_memory_limit_refuse_to_start() {
     let logs = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(2), "{logs}");
     assert!(logs.contains("memory limit 192 MiB cannot hold"), "{logs}");
+}
+
+/// A memory limit the idle cache already uses a tenth of, so a 0.1 high-water mark trips the
+/// guard without filling memory.
+const GUARD_DOCKER: [&str; 2] = ["--memory=768m", "--memory-swap=768m"];
+const GUARD_TRIP: [&str; 2] = ["--memguard-high=0.1", "--memguard-low=0.05"];
+
+async fn guard_bans(c: &Container) -> f64 {
+    metric(c.management, "stalewise_memguard_bans_total").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn memory_guard_bans_only_its_own_shard_and_requests_keep_succeeding() {
+    let (port, _origin) = start_origin().await;
+    let kube_port = start_fake_kube(&[PEER_A, PEER_B]).await;
+    let dir = temp_dir("guard-shard");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    std::fs::write(dir.join("kubeconfig"), kubeconfig(kube_port)).unwrap();
+    let name = format!("stalewise-it-guard-shard-{}", std::process::id());
+    docker(&["network", "create", "--subnet", PEER_SUBNET, &name]);
+    let network = Network(name);
+    let node = async |ip: &str, pod: &str, trip: bool| {
+        let mut args = peer_args(port, ip, pod);
+        args.extend(["--shard", "--membership-debounce=100ms"].map(str::to_owned));
+        if trip {
+            args.extend(GUARD_TRIP.map(str::to_owned));
+        }
+        run_peer_docker(&dir, &network.0, ip, args, &GUARD_DOCKER).await
+    };
+    let a = node(PEER_A, "cache-0", true).await;
+    let b = node(PEER_B, "cache-1", false).await;
+    for c in [&a, &b] {
+        wait_for("two-peer ring", Duration::from_secs(60), async || {
+            ring_size(c) == 2
+        })
+        .await;
+        warm(c.traffic).await;
+    }
+    let paths: Vec<String> = (0..40).map(|n| format!("/shard/g{n}")).collect();
+    let all_ok = async || {
+        for path in &paths {
+            for c in [&a, &b] {
+                assert_eq!(
+                    request(c.traffic, "GET", path, "").await.status,
+                    200,
+                    "{path}"
+                );
+            }
+        }
+    };
+    all_ok().await;
+    wait_for(
+        "a guard ban on the tripped node",
+        Duration::from_secs(30),
+        async || guard_bans(&a).await >= 1.0,
+    )
+    .await;
+    all_ok().await;
+    assert_eq!(metric(a.management, "stalewise_memguard_active").await, 1.0);
+    assert_eq!(guard_bans(&b).await, 0.0, "the guard never reaches a peer");
+    assert_eq!(metric(b.management, "stalewise_memguard_active").await, 0.0);
+    let ready = request(a.management, "GET", "/readyz", "").await;
+    assert_eq!(ready.status, 200, "{}", ready.body);
+    assert!(!ready.body.contains("memory guard"), "{}", ready.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; CI runs it"]
+async fn memory_guard_bans_and_signaller_purges_run_together() {
+    let (port, _origin) = start_origin().await;
+    let dir = temp_dir("guard-purge");
+    std::fs::write(dir.join("token"), TOKEN).unwrap();
+    let mut args = base_args(port);
+    args.extend(GUARD_TRIP.map(str::to_owned));
+    let extra: Vec<String> = GUARD_DOCKER.map(str::to_owned).to_vec();
+    let c = run_cache_with(&dir, &extra, &args).await;
+    warm(c.traffic).await;
+    let auth = format!("Authorization: Bearer {TOKEN}\r\nX-Stalewise-Wait: 5s\r\n");
+    // The guard cannot ban before varnishd is 10s old, so this loop spans its first ban.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut purges = 0;
+    while Instant::now() < deadline {
+        let path = format!("/cache?p={purges}");
+        request(c.traffic, "GET", &path, "").await;
+        assert!(
+            request(c.traffic, "GET", &path, "").await.is_hit(),
+            "{path}"
+        );
+        let reply = request(c.signaller, "PURGE", &path, &auth).await;
+        assert!(reply.status < 300, "purge {path}: {}", reply.status);
+        assert!(
+            !request(c.traffic, "GET", &path, "").await.is_hit(),
+            "{path} purged"
+        );
+        purges += 1;
+        // Paced: a tight loop of fresh connections exhausts the Docker port proxy, not Varnish.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(guard_bans(&c).await >= 1.0, "{}", logs(&c.id));
+    assert_eq!(
+        metric(c.management, "stalewise_memguard_failures_total").await,
+        0.0
+    );
+    assert_eq!(
+        metric(
+            c.management,
+            "stalewise_signaller_exhausted_deliveries_total"
+        )
+        .await,
+        0.0
+    );
 }

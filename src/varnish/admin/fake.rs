@@ -39,6 +39,7 @@ pub struct State {
     pub active: String,
     pub inline_count: usize,
     pub lost_reply: bool,
+    pub bans: Vec<String>,
 }
 
 pub struct FakeVarnish {
@@ -184,6 +185,10 @@ fn apply(text: &str, behavior: &Behavior, state: &Mutex<State>) -> (u16, String)
     let name = parts.next().unwrap_or_default().to_owned();
     match verb {
         "ping" => (200, "PONG 1700000000 1.0".into()),
+        "ban" => {
+            st.bans.push(text.trim_start_matches("ban ").to_owned());
+            (200, String::new())
+        }
         "vcl.inline" => {
             let source = unquote(parts.next().unwrap_or_default());
             st.inline_count += 1;

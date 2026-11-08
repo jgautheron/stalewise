@@ -122,6 +122,18 @@ spec:
               value: {{ .Values.transitBuffer | int64 | toString | quote }}
             - name: STALEWISE_NUKE_LIMIT
               value: {{ .Values.nukeLimit | int64 | toString | quote }}
+            - name: STALEWISE_MEMGUARD
+              value: {{ .Values.memguard.enabled | quote }}
+            - name: STALEWISE_MEMGUARD_HIGH
+              value: {{ .Values.memguard.high | toString | quote }}
+            - name: STALEWISE_MEMGUARD_LOW
+              value: {{ .Values.memguard.low | toString | quote }}
+            - name: STALEWISE_MEMGUARD_MIN_AGE
+              value: {{ .Values.memguard.minAge | quote }}
+            - name: STALEWISE_MEMGUARD_INTERVAL
+              value: {{ .Values.memguard.interval | quote }}
+            - name: STALEWISE_MALLOC_ARENA_MAX
+              value: {{ .Values.mallocArenaMax | int64 | toString | quote }}
             - name: STALEWISE_MAX_VCLS
               value: {{ .Values.maxVcls | int64 | toString | quote }}
             - name: STALEWISE_UNCACHEABLE_TTL

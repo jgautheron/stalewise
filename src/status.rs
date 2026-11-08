@@ -22,6 +22,7 @@ pub enum Reason {
     PersistenceFailed,
     CleanupFailed,
     RetentionExceeded,
+    MemguardFailed,
 }
 
 impl Reason {
@@ -39,6 +40,7 @@ impl Reason {
             Self::PersistenceFailed => "active VCL not persisted",
             Self::CleanupFailed => "VCL cleanup failed",
             Self::RetentionExceeded => "VCL retention bound exceeded; loads paused",
+            Self::MemguardFailed => "memory guard failing",
         }
     }
 }

@@ -17,6 +17,10 @@ use crate::varnish::admin::{self, AdminConfig};
 const ADMIN_POLL: Duration = Duration::from_millis(200);
 const MAX_LOG_LINE: usize = 256;
 const ZERO_DEFAULTS: [&str; 3] = ["default_ttl=0", "default_grace=0", "default_keep=0"];
+/// Varnish holds the lurker off new bans for 60s by default; the guard needs eviction within
+/// seconds, and a short hold keeps `obj.age` drift past the ban's T to about a second. Evicted
+/// hash entries linger two cooloffs (2 x 180s by default); 60s is Varnish's own minimum.
+const MEMGUARD_PARAMS: [&str; 2] = ["ban_lurker_age=1", "critbit_cooloff=60"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
@@ -44,6 +48,11 @@ pub struct ProcessConfig {
     pub nuke_limit: u32,
     pub work_dir: PathBuf,
     pub params: Vec<VarnishParam>,
+    /// The memory guard's bans need the lurker to act within seconds.
+    pub memguard: bool,
+    /// Caps glibc malloc arenas in varnishd; `None` keeps glibc's default of 8 per core, which
+    /// leaves freed object memory scattered and inflated RSS by a third under churn.
+    pub malloc_arena_max: Option<u32>,
     pub startup_timeout: Duration,
     pub shutdown_timeout: Duration,
 }
@@ -83,6 +92,12 @@ pub fn arguments(config: &ProcessConfig) -> Vec<OsString> {
             format!("nuke_limit={}", config.nuke_limit),
         ])
         .chain(
+            MEMGUARD_PARAMS
+                .iter()
+                .filter(|_| config.memguard)
+                .map(|p| (*p).to_owned()),
+        )
+        .chain(
             config
                 .params
                 .iter()
@@ -107,7 +122,11 @@ pub async fn supervise(
     state: watch::Sender<ProcessState>,
     stop: CancellationToken,
 ) -> Result<ExitStatus, ProcessError> {
-    let mut child = Command::new(&config.bin)
+    let mut command = Command::new(&config.bin);
+    if let Some(arenas) = config.malloc_arena_max {
+        command.env("MALLOC_ARENA_MAX", arenas.to_string());
+    }
+    let mut child = command
         .args(arguments(&config))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -268,6 +287,8 @@ mod tests {
                 key: "thread_pools".into(),
                 value: "2".into(),
             }],
+            memguard: true,
+            malloc_arena_max: Some(4),
             startup_timeout: Duration::from_secs(2),
             shutdown_timeout: Duration::from_millis(500),
         }
@@ -313,6 +334,10 @@ mod tests {
                 "transit_buffer=1048576",
                 "-p",
                 "nuke_limit=10000",
+                "-p",
+                "ban_lurker_age=1",
+                "-p",
+                "critbit_cooloff=60",
                 "-p",
                 "thread_pools=2",
             ]

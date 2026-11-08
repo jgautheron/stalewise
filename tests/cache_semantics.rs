@@ -1041,12 +1041,16 @@ const SMALL_BODY: usize = 2 * 1024;
 
 /// Fills the cache with distinct small objects over 32 keep-alive connections; panics on any non-200.
 async fn fill_small(f: &Fixture, from: usize, count: usize) {
+    fill_sized(f, from, count, SMALL_BODY).await;
+}
+
+async fn fill_sized(f: &Fixture, from: usize, count: usize, size: usize) {
     const WORKERS: usize = 32;
     let mut route = Route::headers(&[("cache-control", "max-age=600")]);
-    route.body = Some(Bytes::from(vec![b's'; SMALL_BODY]));
+    route.body = Some(Bytes::from(vec![b's'; size]));
     route
         .headers
-        .push(("content-length".into(), SMALL_BODY.to_string()));
+        .push(("content-length".into(), size.to_string()));
     f.origin.set_fallback(route);
     let traffic = f.cache.traffic;
     let workers = (0..WORKERS).map(|worker| async move {
@@ -1166,4 +1170,188 @@ async fn sequential_large_objects_past_storage_evict_the_oldest_and_never_trunca
     assert_eq!(f.origin.count(&newest), 1, "the newest object is a hit");
     assert_eq!(throttled(f.cache.traffic, "/cap0", usize::MAX).await, whole);
     assert_eq!(f.origin.count("/cap0"), 2, "the oldest object was evicted");
+}
+
+/// 64m storage of 100-byte objects holds about 166k of them, whose 1 KiB overhead each needs far
+/// more memory than this limit, which still passes the startup check (64m + 16m + 128 MiB).
+const GUARD_LIMIT: u64 = 224 * MIB as u64;
+const GUARD_OBJECTS: usize = 200_000;
+const TINY_BODY: usize = 100;
+/// New objects per second; the guard never bans objects younger than 10s, so the newest
+/// 10 seconds of fill must fit.
+const GUARD_RATE: usize = 2_500;
+
+async fn guard_fixture(name: &str, guard: bool) -> Fixture {
+    let docker_extra = [
+        format!("--memory={GUARD_LIMIT}"),
+        format!("--memory-swap={GUARD_LIMIT}"),
+    ];
+    let extra = [
+        "--transient-storage=malloc,16m".to_owned(),
+        format!("--memguard={guard}"),
+    ];
+    fixture_with(
+        name,
+        Profile::Generic,
+        "malloc,64m",
+        false,
+        &docker_extra,
+        &extra,
+    )
+    .await
+}
+
+/// Fills distinct tiny objects at `GUARD_RATE` over keep-alive connections; stops at the first
+/// failure, returning how many requests succeeded.
+async fn fill_paced(f: &Fixture, count: usize) -> usize {
+    const WORKERS: usize = 16;
+    let mut route = Route::headers(&[("cache-control", "max-age=3600")]);
+    route.body = Some(Bytes::from(vec![b't'; TINY_BODY]));
+    route
+        .headers
+        .push(("content-length".into(), TINY_BODY.to_string()));
+    f.origin.set_fallback(route);
+    let traffic = f.cache.traffic;
+    let start = tokio::time::Instant::now();
+    let workers = (0..WORKERS).map(|worker| async move {
+        let mut done = 0;
+        let Ok(stream) = tokio::net::TcpStream::connect(traffic).await else {
+            return done;
+        };
+        let Ok((mut sender, conn)) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await
+        else {
+            return done;
+        };
+        let _driver = Driver(tokio::spawn(async move {
+            let _ = conn.await;
+        }));
+        for n in (worker..count).step_by(WORKERS) {
+            let due = Duration::from_secs_f64(n as f64 / GUARD_RATE as f64);
+            tokio::time::sleep_until(start + due).await;
+            let req = Request::builder()
+                .uri(format!("/tiny-{n}"))
+                .header("host", "catalog.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let ok = match sender.ready().await {
+                Ok(()) => match sender.send_request(req).await {
+                    Ok(r) => r.status() == 200 && r.into_body().collect().await.is_ok(),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if !ok {
+                return done;
+            }
+            done += 1;
+        }
+        done
+    });
+    futures_util::future::join_all(workers)
+        .await
+        .into_iter()
+        .sum()
+}
+
+fn state(id: &str) -> String {
+    docker(&[
+        "inspect",
+        "-f",
+        "{{.State.Running}} {{.State.OOMKilled}} {{.RestartCount}}",
+        id,
+    ])
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker"]
+async fn memory_guard_evicts_the_oldest_objects_before_an_oom_kill() {
+    let f = guard_fixture("memguard-on", true).await;
+    let environ = docker(&[
+        "exec",
+        &f.cache.id,
+        "sh",
+        "-c",
+        "tr '\\0' '\\n' < /proc/$(pidof varnishd | cut -d' ' -f1)/environ",
+    ]);
+    assert!(environ.contains("MALLOC_ARENA_MAX=4"), "{environ}");
+    let stored = fill_paced(&f, GUARD_OBJECTS).await;
+    let peak = memory_peak(&f.cache.id);
+    let bans = metric(f.cache.management, "stalewise_memguard_bans_total").await;
+    let objects = stat(&f.cache.id, "MAIN.n_object");
+    eprintln!(
+        "guard on: stored={stored} peak={peak} bans={bans} objects={objects} lurker_killed={}",
+        stat(&f.cache.id, "MAIN.bans_lurker_obj_killed")
+    );
+    assert_eq!(state(&f.cache.id), "true false 0", "{}", logs(&f.cache.id));
+    assert_eq!(stored, GUARD_OBJECTS);
+    assert!(peak < GUARD_LIMIT, "memory peak {peak}");
+    assert!(bans > 0.0, "the guard banned");
+    assert!(
+        stat(&f.cache.id, "MAIN.bans_lurker_obj_killed") > 0,
+        "the lurker evicted"
+    );
+    assert!(metric(f.cache.management, "stalewise_memory_limit_bytes").await == GUARD_LIMIT as f64);
+    let before = f.origin.count(&format!("/tiny-{}", GUARD_OBJECTS - 1));
+    for n in GUARD_OBJECTS - 100..GUARD_OBJECTS {
+        let reply = request(f.cache.traffic, "GET", &format!("/tiny-{n}"), "").await;
+        assert!(reply.is_hit(), "/tiny-{n}: recent objects survive");
+    }
+    assert_eq!(
+        f.origin.count(&format!("/tiny-{}", GUARD_OBJECTS - 1)),
+        before
+    );
+    let first = request(f.cache.traffic, "GET", "/tiny-0", "").await;
+    assert!(!first.is_hit(), "the oldest object was evicted");
+    // A ban may still follow the fill's last growth, and its lurker walk may still be running.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let settled_bans = metric(f.cache.management, "stalewise_memguard_bans_total").await;
+    let settled = stat(&f.cache.id, "MAIN.n_object");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let idle_bans = metric(f.cache.management, "stalewise_memguard_bans_total").await;
+    assert_eq!(idle_bans, settled_bans, "an idle cache is not drained");
+    assert!(
+        stat(&f.cache.id, "MAIN.n_object") >= settled,
+        "objects stay cached when idle"
+    );
+    let ban_list = docker(&[
+        "exec",
+        &f.cache.id,
+        "varnishadm",
+        "-T",
+        "127.0.0.1:6082",
+        "-S",
+        "/var/lib/stalewise/run/admin.secret",
+        "ban.list",
+    ]);
+    assert!(
+        !ban_list.contains("obj.age"),
+        "the lurker completes and drops every guard ban: {ban_list}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker"]
+async fn without_the_memory_guard_the_same_fill_is_oom_killed() {
+    let f = guard_fixture("memguard-off", false).await;
+    let stored = fill_paced(&f, GUARD_OBJECTS).await;
+    let oom = stat_or_dead(&f.cache.id);
+    eprintln!("guard off: stored={stored} state={oom}");
+    assert!(stored < GUARD_OBJECTS, "requests failed mid-fill");
+    assert!(
+        oom.starts_with("true"),
+        "the kernel OOM-killed varnishd: {oom}"
+    );
+}
+
+/// Docker's OOM flag, exit code and running state. Outside Kubernetes the kernel kills only the
+/// varnishd cache child, which its manager restarts empty; a pod with `memory.oom.group` dies.
+fn stat_or_dead(id: &str) -> String {
+    std::thread::sleep(Duration::from_secs(2));
+    docker(&[
+        "inspect",
+        "-f",
+        "{{.State.OOMKilled}} {{.State.ExitCode}} {{.State.Running}}",
+        id,
+    ])
 }

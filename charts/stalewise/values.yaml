@@ -47,6 +47,18 @@ nukeLimit: 10000
 capacity:
   # Objects held at once, about 1 KiB each outside storage; 65536 is 256m of 4 KiB objects.
   maxObjects: 65536
+# Memory-pressure watchdog: bans the longest-cached objects when the working set passes `high` of
+# the memory limit, until it falls below `low`. A safety net beneath the sizing; see the README.
+memguard:
+  enabled: true
+  high: 0.85
+  low: 0.75
+  # Objects cached for less than this are never banned by the guard.
+  minAge: 10s
+  interval: 1s
+# glibc malloc arenas in varnishd (MALLOC_ARENA_MAX); 4 measured a third less memory under object
+# churn than glibc's default, at equal throughput. 0 keeps glibc's default.
+mallocArenaMax: 4
 maxVcls: 5
 uncacheableTtl: 30s
 maxObjectSize: 10485760

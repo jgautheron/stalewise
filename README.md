@@ -99,6 +99,9 @@ The embedded templates cache only what the origin's headers allow.
 - `--nuke-limit` (default 10000, chart `nukeLimit`) sets Varnish `nuke_limit`, the number of objects one fetch may evict to make room.
   Varnish defaults to 50. With storage full of 2 KiB objects, a 9 MiB response then failed mid-stream and the client received a truncated body.
   A fetch that still runs out of evictions is cut short the same way, and Varnish counts it in `MAIN.n_lru_limited`.
+- Cached responses stream to the client while Varnish fetches them, so a backend connection that closes before `Content-Length` truncates the client body.
+  Varnish logs `FetchError straight insufficient bytes` and counts the fetch in `MAIN.fetch_failed`; storage limits do not cause this error.
+  Varnish cannot retry such a fetch because the client has already received bytes.
 - `Surrogate-Key` and `Cache-Tag` values are indexed for tag invalidation and removed before delivery.
 
 ## Cache policies

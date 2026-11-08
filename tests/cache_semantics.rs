@@ -1131,3 +1131,39 @@ async fn small_objects_past_storage_evict_within_the_chart_minimum_memory() {
     assert!(peak < LIMIT, "memory peak {peak}");
     assert_eq!(stat(&f.cache.id, "MAIN.n_lru_limited"), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker"]
+async fn sequential_large_objects_past_storage_evict_the_oldest_and_never_truncate() {
+    const COUNT: usize = 300;
+    let f = fixture_with(
+        "large-fill",
+        Profile::Generic,
+        "malloc,64m",
+        false,
+        &[],
+        &["--transient-storage=malloc,16m".into()],
+    )
+    .await;
+    let mut route = Route::headers(&[("cache-control", "public, max-age=3600")]);
+    route
+        .headers
+        .push(("content-length".into(), MIB.to_string()));
+    route.size = Some(MIB);
+    f.origin.set_fallback(route);
+    let whole = Ok((MIB, checksum(MIB)));
+    let mut truncated = Vec::new();
+    for n in 0..COUNT {
+        if throttled(f.cache.traffic, &format!("/cap{n}"), usize::MAX).await != whole {
+            truncated.push(n);
+        }
+    }
+    assert_eq!(truncated, Vec::<usize>::new(), "truncated bodies");
+    assert_eq!(stat(&f.cache.id, "MAIN.fetch_failed"), 0);
+    assert!(stat(&f.cache.id, "MAIN.n_lru_nuked") > 0, "storage is full");
+    let newest = format!("/cap{}", COUNT - 1);
+    assert_eq!(throttled(f.cache.traffic, &newest, usize::MAX).await, whole);
+    assert_eq!(f.origin.count(&newest), 1, "the newest object is a hit");
+    assert_eq!(throttled(f.cache.traffic, "/cap0", usize::MAX).await, whole);
+    assert_eq!(f.origin.count("/cap0"), 2, "the oldest object was evicted");
+}

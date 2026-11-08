@@ -14,6 +14,8 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 - stalewise reads the cgroup memory limit at startup. It refuses to start when the stores plus the 128 MiB base exceed the limit, and warns when the headroom is tight.
 - A large response no longer arrives truncated when storage is full of small objects. `--nuke-limit` (`STALEWISE_NUKE_LIMIT`, default 10000, chart `nukeLimit`) replaces the Varnish default of 50, which made a 9 MiB fetch give up mid-stream.
 
+- A Docker test fills 64m of storage with 300 objects of 1 MiB and requires every body whole, the newest object a hit and the oldest evicted. Truncated bodies seen behind an Istio sidecar were backend connections closing before `Content-Length` (`FetchError straight insufficient bytes`), not eviction. Varnish 9.1 in Docker shows no truncation at any `nuke_limit` from 50 to 100000. The README documents the failure mode.
+
 ### Changed
 
 - **Chart:** the default `resources` no longer sets a memory limit or request; both are derived (512Mi with the defaults).

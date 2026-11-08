@@ -237,17 +237,17 @@ The chart derives the memory limit from the stores and the expected object count
 Each release publishes the chart as an OCI artifact and the image at the same version:
 
 ```sh
-helm install catalog-cache oci://ghcr.io/jgautheron/charts/stalewise --version 0.4.0 \
+helm install catalog-cache oci://ghcr.io/jgautheron/charts/stalewise --version 0.5.0 \
   --set backend.service=catalog --set fullnameOverride=catalog-cache
 ```
 
-The chart defaults `image.tag` to its `appVersion`, so it pulls `ghcr.io/jgautheron/stalewise:0.4.0`.
+The chart defaults `image.tag` to its `appVersion`, so it pulls `ghcr.io/jgautheron/stalewise:0.5.0`.
 Images are signed keylessly with cosign from the release workflow.
 The signature covers the exact index digest the workflow created, never whatever a tag points to later.
 Verify a signature before you deploy:
 
 ```sh
-cosign verify ghcr.io/jgautheron/stalewise:0.4.0 \
+cosign verify ghcr.io/jgautheron/stalewise:0.5.0 \
   --certificate-identity-regexp '^https://github.com/jgautheron/stalewise/.github/workflows/image.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```

@@ -2,8 +2,8 @@ apiVersion: v2
 name: stalewise
 description: Varnish cache supervised by stalewise, one Deployment per cached Service.
 type: application
-version: 0.4.0
-appVersion: "0.4.0"
+version: 0.5.0
+appVersion: "0.5.0"
 kubeVersion: ">=1.33.0-0"
 home: https://github.com/jgautheron/stalewise
 sources:

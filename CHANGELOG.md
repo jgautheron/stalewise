@@ -8,6 +8,8 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-08
+
 ### Security
 
 - Only WebSocket handshakes are piped. Other `Upgrade` requests pass with the header removed, and `Expect` requests pass, so a declined upgrade can no longer tunnel later requests past VCL.
@@ -31,6 +33,14 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 - `--log-level` accepts a level or comma-separated `target=level` directives; span and field filters are no longer accepted and fail startup.
 - Log lines and CLI help no longer contain ANSI color codes, and mistyped flags no longer get spelling suggestions.
 - The signaller answers 503 `entropy unavailable` when the OS random source fails instead of panicking.
+
+### Tests
+
+- HTTP cache semantics matrix against real Varnish (`tests/cache_semantics.rs`, `docs/testing.md`), payloads from 0 bytes to 200 MiB, and Kyverno Chainsaw suites in kind for install, CachePolicy status, attachment, many releases, RBAC and rollout. Mutation evidence is in `docs/mutation-evidence.md`.
+
+### Dependencies
+
+- Dropped `rand` (now `getrandom`) and the regex-based log filter; trimmed default features. 256 to 242 locked packages. `cargo deny` allows crates.io only and fails on new duplicate versions; Dependabot covers cargo, actions and docker.
 
 ## [0.3.0] - 2026-11-07
 

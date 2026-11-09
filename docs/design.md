@@ -255,3 +255,68 @@ Implement status first, then membership and VCL forwarding. Require three-instan
 - `X-Stalewise-Peer-Tags` uses the stored `,tag,` form; `,` encodes an empty tag set so the field is always present.
 - A wait returns as soon as every target is terminal: 200 when all delivered, otherwise 504 without waiting for the timeout.
 - `--pod-name` is required by the signaller as well as sharding, because status reports the admitting pod.
+
+
+## v0.7: Operator mode
+
+Planned, not implemented. [ADR 0006](adr/0006-operator.md) defines the resource, security, ownership, upgrade and rollback contracts.
+Standalone operation remains supported; operator mode replaces per-application workload packaging, not the data plane.
+
+### Binary and runtime
+
+Add `stalewise operator` to the existing binary and image.
+It starts no Varnish process and skips cache-specific configuration and cgroup checks.
+Default invocation and `stalewise crd` remain compatible; add an explicit CRD selection for HTTPCache or both definitions.
+One artifact simplifies release/image alignment; accept unused Varnish bytes in the operator container rather than another image pipeline.
+
+Use the existing kube-rs runtime's controller and watcher facilities, with one Lease-elected active reconciler.
+Keep `controller.rs` responsible for per-cache policy activation and status; do not move VCL activation into the operator.
+Proposed operator interfaces are:
+
+```rust
+fn resolve(cache: &HTTPCache, inputs: &Inputs) -> Result<ValidatedCache, SpecError>;
+fn build(cache: &ValidatedCache, release: &Release) -> DesiredChildren;
+async fn reconcile(cache: Arc<HTTPCache>, context: Arc<Context>) -> Result<Action, ReconcileError>;
+```
+
+`Inputs` contains observed origin, policy, route and platform settings, never application credentials.
+`resolve` owns reference checks and effective defaults; CRD schema/CEL owns admission constraints.
+`build` is pure and deterministic: no API calls, random tokens, clock reads or Helm execution.
+The Secret lifecycle supplies an existing or newly generated token separately to the apply step.
+
+Each reconciliation follows five steps:
+
+1. Check scope, deletion and ownership; resolve inputs without replacing missing observations with success.
+2. Build desired children and evaluate attachment through the existing pure validator.
+3. Apply prerequisites, then admit workload changes through the fleet rollout queue.
+4. Observe Deployment completion; remove obsolete children only after dependent pods finish.
+5. Patch changed status and return a bounded requeue; never sleep while holding a reconciliation worker.
+
+Owned-resource events repair drift; Service, CachePolicy and VirtualService events enqueue affected caches.
+Periodic resync covers missed events; status-only writes must converge without hot loops.
+Typed errors distinguish invalid specifications, ownership conflicts, API failures and stalled rollouts.
+Use ADR deadlines/backoff; leader loss stops mutations and new rollout admission immediately.
+
+### Single source of truth
+
+Move sizing, mesh annotations, probes and shutdown rules into Rust builders, reusing `capacity.rs` constants and configuration validators.
+There are two consumers: operator reconciliation and standalone chart packaging.
+Helm cannot execute Rust at template-render time.
+Generate the chart's relevant helpers, validation expressions and static probe fragments at release-build time from the same rule definitions.
+Use a narrow emitter for these shared expressions, not a general Rust-to-Helm compiler.
+Keep generated files committed; CI regeneration must produce no diff.
+Do not hand-maintain equivalent arithmetic or safety conditions in templates and builders.
+Keep existing standalone values and ordinary Helm installation working without a post-renderer or operator dependency.
+Treat old chart output as migration fixtures, not another rule source; gate the move on semantic output parity.
+
+### Acceptance and handoff
+
+- Unit-test defaulting, sizing boundaries, proxy budgets, selectors, probes, drain timing, security resources, token retention and ownership collisions.
+- Compare standalone renders and builder outputs for equivalent settings, including invalid inputs and absent fields.
+- Add a kind Chainsaw suite proving Ready, garbage collection, upgrade rollouts, restart-safe concurrency limits and conflict handling.
+- Check positive and negative `kubectl auth can-i` cases for operator/cache identities; also submit forbidden Roles to test admission.
+- Keep sending hits and misses while stopping the operator; verify serving, readiness and last configuration remain unchanged.
+
+Chainsaw adds a pinned CI test tool and maintenance obligation, not a runtime dependency.
+The Rust engineer owns these gates; application-chart authors own route-order and authorization smoke tests.
+No TUI changes are needed. Protected-route eligibility requires platform approval before adoption.

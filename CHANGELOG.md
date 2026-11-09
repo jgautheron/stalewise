@@ -8,6 +8,8 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-09
+
 ### Added
 
 - A memory guard keeps a pod from being OOM-killed when the object count outgrows the sizing formula. When the container working set reaches `--memguard-high` (default 0.85) of the memory limit, stalewise bans the longest-cached objects with `ban obj.age > T` on the local admin port. It halves T down to `--memguard-min-age` (default 10s) while memory keeps growing, and stops below `--memguard-low` (default 0.75). The chart exposes `memguard.enabled` (default true), `high`, `low`, `minAge` and `interval`. A 224 MiB container filled with 200,000 objects of 100 bytes peaked at a 208 MB working set with the guard and was OOM-killed without it.
@@ -18,6 +20,10 @@ The 0.1.0 and 0.2.0 sections describe untagged development milestones whose chan
 - varnishd runs with `MALLOC_ARENA_MAX=4` (`--malloc-arena-max`, chart `mallocArenaMax`). Under object churn this measured 240 MB instead of 316 MB peak memory at the same throughput.
 - With the memory guard enabled, varnishd runs with `ban_lurker_age=1` (Varnish default 60s) and `critbit_cooloff=60` (default 180s). `--varnish-param` still overrides both.
 - Durations accept an `h` unit.
+
+### Verified
+
+- In an Istio STRICT-mTLS cluster, a 209Mi pod filled with 100,000 small objects answered every request with the guard (2 bans, 187 of 219 MB) and was OOM-killed with 2,548 errors without it.
 
 ## [0.5.0] - 2026-11-08
 
